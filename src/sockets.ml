@@ -16,12 +16,12 @@ let rec send fd buf offset len =
     Lwt.return_error
   >>= function
   | Ok len' ->
-    Log.debug (fun m -> m "Wrote %d to fd" len');
-    if len' < len then send fd buf (offset + len') (len - len')
-    else Lwt.return_ok ()
+      Log.debug (fun m -> m "Wrote %d to fd" len');
+      if len' < len then send fd buf (offset + len') (len - len')
+      else Lwt.return_ok ()
   | Error e ->
-    Log.err (fun m -> m "Failed to send %a" Fmt.exn e);
-    Lwt.return_error e
+      Log.err (fun m -> m "Failed to send %a" Fmt.exn e);
+      Lwt.return_error e
 
 module Outgoing = struct
   type t = {
@@ -75,12 +75,12 @@ module Outgoing = struct
       match switch with Some switch -> switch | None -> Lwt_switch.create ()
     in
     let off_p, off_f = Lwt.task () in
-    Lwt_switch.add_hook (Some switch) (fun () ->
+    Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
         Lwt.wakeup off_f (Error Closed);
-        Lwt.return_unit);
+        Lwt.return_unit) >>= fun () ->
     let latest_xmit = Lwt.return_ok () in
     let t = { fd; latest_xmit; switch_off_promise = off_p; switch } in
-    t
+    Lwt.return t
 end
 
 module Incomming = struct
@@ -118,6 +118,9 @@ module Incomming = struct
         (fun () -> Lwt_unix.read t.fd recv_buffer 0 buf_size >>= Lwt.return_ok)
         Lwt.return_error
       >>= function
+      | _ when not (Lwt_switch.is_on t.switch) ->
+          Log.debug (fun m -> m "Connection closed");
+          Lwt.return_unit
       | Error e ->
           Log.err (fun m ->
               m "Failed to receive with %a, closing conn" Fmt.exn e);
@@ -128,7 +131,8 @@ module Incomming = struct
           | Ok () -> loop ()
           | Error `EOF ->
               Log.debug (fun m -> m "Connection closed with EOF");
-              Lwt_switch.turn_off t.switch )
+              Lwt_switch.(
+                if is_on t.switch then Lwt_switch.turn_off t.switch else Lwt.return_unit) )
     in
     loop ()
 
@@ -140,8 +144,8 @@ module Incomming = struct
     let recv_cond = Lwt_condition.create () in
     let t = { fd; decoder; switch; recv_cond } in
     Lwt.async (fun () -> recv_thread t);
-    Lwt_switch.add_hook (Some switch) (fun () ->
+    Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
         Lwt_condition.broadcast recv_cond ();
-        Lwt.return_unit);
-    t
+        Lwt.return_unit) >>= fun () ->
+    Lwt.return t
 end

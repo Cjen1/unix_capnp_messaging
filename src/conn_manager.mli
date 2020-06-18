@@ -16,7 +16,7 @@ type node_id = int64
 
 (* Handler type for listeners *)
 type recv_handler =
-  node_id -> Capnp.MessageSig.ro Capnp.BytesMessage.Message.t -> unit Lwt.t
+  t -> node_id -> Capnp.MessageSig.ro Capnp.BytesMessage.Message.t -> (unit, exn) Lwt_result.t
 
 (* Creates a new connection manager listening on [listen_address] with id: [node_id] *)
 val create :

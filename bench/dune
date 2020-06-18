@@ -1,0 +1,3 @@
+(executables
+ (names bench_cmgr)
+ (libraries core library))

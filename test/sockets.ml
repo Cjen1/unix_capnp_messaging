@@ -32,15 +32,10 @@ let test_of_to_store () =
     (test_message |> Bytes.to_string)
     (test_message |> of_store |> to_store |> Bytes.to_string)
 
-let test_lwt_result str test_exn res =
-  match res with
-  | Ok _v -> Alcotest.fail (Fmt.str "No exception raised for %s" str)
-  | Error exn -> Alcotest.check_raises str test_exn (fun () -> raise exn)
-
 let test_loop _ () =
   let fd1, fd2 = Lwt_unix.pipe () in
-  let ins = Incomming.create fd1 in
-  let out = Outgoing.create fd2 in
+  let switch = Lwt_switch.create () in
+  Lwt.both (Incomming.create ~switch fd1) (Outgoing.create ~switch fd2) >>= fun (ins, out) ->
   test_message |> of_store |> Outgoing.send out |> exn_handler;
   Lwt.choose [ timeout 1.; Incomming.recv ins ] >>= fun msg ->
   let ( >>>= ) = Result.bind in
@@ -48,7 +43,7 @@ let test_loop _ () =
     "Send and receive"
     (Ok (test_message |> Bytes.to_string))
     (msg >>>= fun msg -> Ok (msg |> to_store |> Bytes.to_string));
-  Lwt.return_unit
+  Lwt_switch.turn_off switch
 
 let some_wrap f () = f () >>= fun v -> Lwt.return_some v
 
@@ -56,8 +51,9 @@ let none_wrap f () = f () >>= fun _ -> Lwt.return_none
 
 let test_stress size _ () =
   let fd1, fd2 = Lwt_unix.pipe () in
-  let ins = Incomming.create fd1 in
-  let out = Outgoing.create fd2 in
+  let switch = Lwt_switch.create () in
+  Lwt.both (Incomming.create ~switch fd1) (Outgoing.create ~switch fd2)
+  >>= fun (ins, out) ->
   let test_message i =
     let buf = Bytes.create 8 in
     Bytes.set_int64_le buf 0 (Int64.of_int i);
@@ -83,19 +79,26 @@ let test_stress size _ () =
   let fold v expected =
     let buf = to_store v in
     let i = Bytes.get_int64_le buf 0 in
-    Alcotest.(check int) (Fmt.str "Checking recv %d" expected) (Int64.to_int i) expected;
+    Alcotest.(check int)
+      (Fmt.str "Checking recv %d" expected)
+      (Int64.to_int i) expected;
     expected + 1
   in
   let recv_p = Lwt_stream.fold fold recv_stream 0 in
   Lwt.both send_p recv_p >>= fun ((), v) ->
   Alcotest.(check int) "Number processed is same as sent in" size v;
-  Lwt.return_unit
+  Lwt_switch.turn_off switch
 
-let test_closed_errors _ () =
+let test_lwt_result str test_exn res =
+  match res with
+  | Ok _v -> Alcotest.fail (Fmt.str "No exception raised for %s" str)
+  | Error exn -> Alcotest.check_raises str test_exn (fun () -> raise exn)
+
+let test_closed_switch _ () =
   let fd1, fd2 = Lwt_unix.pipe () in
   let switch = Lwt_switch.create () in
-  let ins = Incomming.create ~switch fd1 in
-  let out = Outgoing.create ~switch fd2 in
+  Lwt.both (Incomming.create ~switch fd1) (Outgoing.create ~switch fd2)
+  >>= fun (ins, out) ->
   Lwt_switch.turn_off switch >>= fun () ->
   test_lwt_result "Send on closed outgoing" Sockets.Closed
     (test_message |> of_store |> Outgoing.send out);
@@ -104,28 +107,50 @@ let test_closed_errors _ () =
 
 let detect_close_error _ () =
   let fd1, fd2 = Lwt_unix.pipe () in
-  let ins = Incomming.create fd1 in
-  let out = Outgoing.create fd2 in
+  let switch = Lwt_switch.create () in
+  Lwt.both (Incomming.create fd1) (Outgoing.create fd2) >>= fun (ins, out) ->
   Lwt_unix.close fd1 >>= fun () ->
   test_lwt_result "Send on closed outgoing" Sockets.Closed
     (test_message |> of_store |> Outgoing.send out);
   Incomming.recv ins
   >|= test_lwt_result "Recv on closed incommming" Sockets.Closed
+  >>= fun () -> Lwt_switch.turn_off switch
+
+let reporter =
+  let open Core in
+  let report src level ~over k msgf =
+    let k _ =
+      over ();
+      k ()
+    in
+    let src = Logs.Src.name src in
+    msgf @@ fun ?header ?tags:_ fmt ->
+    Fmt.kpf k Fmt.stdout
+      ("[%a] %a %a @[" ^^ fmt ^^ "@]@.")
+      Time.pp (Time.now ())
+      Fmt.(styled `Magenta string)
+      (Printf.sprintf "%14s" src)
+      Logs_fmt.pp_header (level, header)
+  in
+  { Logs.report }
 
 let () =
+  Logs.(set_level (Some Debug));
+  Logs.set_reporter reporter;
   let open Alcotest_lwt in
   Lwt_main.run
   @@ run "Socket test"
        [
          ("Test infra", [ test_case_sync "to/of store" `Quick test_of_to_store ]);
          ("Basic functionality", [ test_case "Loop test" `Quick test_loop ]);
-         ("Stress test", [
-             test_case "Stressed loop" `Quick (test_stress 1000);
-             test_case "Stressed loop" `Slow (test_stress 100000) 
-           ]);
+         ( "Stress test",
+           [
+             test_case "Stressed loop" `Quick (test_stress 100);
+             test_case "Stressed loop" `Slow (test_stress 1000);
+           ] );
          ( "Exceptions",
            [
-             test_case "Closed switch exceptions" `Quick test_closed_errors;
-             test_case "Closed fd exceptions" `Quick test_closed_errors;
+             test_case "Closed switch exceptions" `Quick test_closed_switch;
+             test_case "Closed fd exceptions" `Quick test_closed_fd;
            ] );
        ]
