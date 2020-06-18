@@ -312,7 +312,7 @@ let send ?(semantics = `AtMostOnce) t id msg =
     match List.assoc_opt id t.active_conns with
     | None -> Lwt.return_error Not_found
     | Some conn_descr ->
-        Sockets.Outgoing.send conn_descr.out_socket msg |> Lwt.return
+        Sockets.Outgoing.send conn_descr.out_socket msg
   in
   match semantics with
   | `AtMostOnce -> send ()

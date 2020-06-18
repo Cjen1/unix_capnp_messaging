@@ -34,41 +34,37 @@ module Outgoing = struct
   let prev_send_wrapper t f =
     let failure e =
       Log.err (fun m -> m "Failed to send with %a" Fmt.exn e);
-      Lwt_switch.turn_off t.switch >>= fun () -> Lwt.return_error e
+      Lwt_switch.turn_off t.switch >>= fun () -> Lwt.return_error Closed
     in
     t.latest_xmit >>= function
-    | Ok () -> Lwt.catch f failure
-    | Error e -> failure e
+    | Ok () -> (
+      Log.debug (fun m -> m "trying to catch f");
+      Lwt.catch f Lwt.return_error >>= function 
+        Ok v -> Lwt.return_ok v 
+      | Error e -> failure e
+    )
+    | Error e -> 
+      Log.debug (fun m -> m "Prev failed");
+      failure e
 
   let send t msg =
-    let rec send buf offset len =
-      Lwt.catch
-        (fun () -> Lwt_bytes.write t.fd buf offset len >>= Lwt.return_ok)
-        Lwt.return_error
-      >>= function
-      | Ok len' ->
-          Log.debug (fun m -> m "Wrote %d to fd" len');
-          if len' < len then send buf (offset + len') (len - len')
-          else Lwt.return_ok ()
-      | Error e ->
-          Log.err (fun m -> m "Failed to send %a" Fmt.exn e);
-          Lwt.return_error e
-    in
     if Lwt_switch.is_on t.switch then (
       Log.debug (fun m -> m "Trying to send");
       let blit dst src ~offset ~len =
         Lwt_bytes.blit_from_bytes src 0 dst offset len
       in
-      try
+      let main () =
         let size, cont = Capnp.Codecs.serialize_generator msg blit in
         let buf = Lwt_bytes.create size in
         let written = cont buf in
         assert (written = size);
-        let msg_p = prev_send_wrapper t (fun () -> send buf 0 size) in
-        t.latest_xmit <- Lwt.choose [ msg_p; t.switch_off_promise ];
-        Ok ()
-      with e -> Fmt.failwith "Failed while sending with: %a" Fmt.exn e )
-    else Error Closed
+        let msg_p = prev_send_wrapper t (fun () -> send t.fd buf 0 size) in
+        let p = Lwt.choose [ msg_p; t.switch_off_promise ] in
+        t.latest_xmit <- p;
+        p
+      in
+      Lwt.catch main Lwt.return_error )
+    else Lwt.return_error Closed
 
   let create ?switch fd =
     let switch =
@@ -77,7 +73,8 @@ module Outgoing = struct
     let off_p, off_f = Lwt.task () in
     Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
         Lwt.wakeup off_f (Error Closed);
-        Lwt.return_unit) >>= fun () ->
+        Lwt.return_unit)
+    >>= fun () ->
     let latest_xmit = Lwt.return_ok () in
     let t = { fd; latest_xmit; switch_off_promise = off_p; switch } in
     Lwt.return t
@@ -132,7 +129,8 @@ module Incomming = struct
           | Error `EOF ->
               Log.debug (fun m -> m "Connection closed with EOF");
               Lwt_switch.(
-                if is_on t.switch then Lwt_switch.turn_off t.switch else Lwt.return_unit) )
+                if is_on t.switch then Lwt_switch.turn_off t.switch
+                else Lwt.return_unit) )
     in
     loop ()
 
@@ -146,6 +144,6 @@ module Incomming = struct
     Lwt.async (fun () -> recv_thread t);
     Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
         Lwt_condition.broadcast recv_cond ();
-        Lwt.return_unit) >>= fun () ->
-    Lwt.return t
+        Lwt.return_unit)
+    >>= fun () -> Lwt.return t
 end
