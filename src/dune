@@ -1,15 +1,4 @@
 (library
- (name ocamlpaxos)
+ (name library)
  (libraries base lwt lwt.unix logs.lwt logs.fmt fmt.tty capnp hex)
 )
-
-(rule
- (targets messaging_api.ml messaging_api.mli)
- (deps messaging_api.capnp)
- (action
-  (run capnpc -o %{bin:capnpc-ocaml} %{deps})))
-
-(env
- (dev
-  (flags
-   (:standard -w -39-53-55))))
