@@ -2,6 +2,10 @@ open Library
 open Conn_manager
 open Lwt.Infix
 
+let src = Logs.Src.create "Bench"
+
+module Log = (val Logs.src_log src : Logs.LOG)
+
 let of_store, to_store =
   let open Capnp.BytesMessage.Message in
   let of_store msg = of_storage [ msg ] in
@@ -13,7 +17,7 @@ let of_store, to_store =
   (of_store, to_store)
 
 let test_message =
-  let buf = Bytes.create 16 in
+  let buf = Bytes.create 128 in
   Bytes.set_int64_le buf 0 (Random.int64 Int64.max_int);
   Bytes.set_int64_le buf 8 (Random.int64 Int64.max_int);
   buf
@@ -29,6 +33,7 @@ let time_it f =
   Unix.gettimeofday () -. start |> Lwt.return
 
 let throughput n () = 
+  Log.info (fun m -> m "Setting up throughput test");
   let ops = List.init n (fun _ -> test_message |> of_store) in
   let m1 = mgr 1 (fun t src msg -> send ~semantics:`AtLeastOnce t src msg) in
   let m2 = mgr 2 (fun _ _ _ -> Lwt.return_ok ()) in
@@ -43,9 +48,12 @@ let throughput n () =
         | Ok () -> Lwt.return_unit
       ) stream
   in 
+  Log.info (fun m -> m "Starting throughput test");
   time_it test >>= fun time -> 
+  Log.info (fun m -> m "Closing managers");
   Lwt.join [close m1; close m2]
   >>= fun () -> 
+  Log.info (fun m -> m "Finished throughput test!");
   Fmt.str "Took %f to do %d operations: %f ops/s" time n Core.Float.((of_int n) / time) |> Lwt.return
 
 let reporter =
