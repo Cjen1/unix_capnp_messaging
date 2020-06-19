@@ -10,10 +10,8 @@
   (synopsis "A basic messaging system for capnp messages. Made as a proof of concept for a high performance messaging system on unix")
   (depends
     lwt
-    lwt.unix
-    logs.lwt
-    logs.fmt
-    fmt.tty
+    logs
+    fmt
     capnp
     alcotest
     core
