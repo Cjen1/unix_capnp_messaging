@@ -303,6 +303,9 @@ let send ?(semantics = `AtMostOnce) t id msg =
     let rec loop () =
       f () >>= function
       | Ok v -> Lwt.return v
+      | Error Sockets.Closed ->
+        Log.debug (fun m -> m "%a: Failed to send on closed socket" Fmt.int64 t.node_id);
+        Lwt.return ()
       | Error exn ->
           handle_err exn;
           (loop [@tailcall]) ()
@@ -318,6 +321,6 @@ let send ?(semantics = `AtMostOnce) t id msg =
   | `AtMostOnce -> send ()
   | `AtLeastOnce ->
       let err_handler exn =
-        Log.err (fun m -> m "Failed to send message with %a" Fmt.exn exn)
+        Log.err (fun m -> m "%a: Failed to send message with %a" Fmt.int64 t.node_id Fmt.exn exn)
       in
       retry_loop err_handler send >>= fun res -> Lwt.return_ok res
