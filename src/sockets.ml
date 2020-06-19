@@ -10,14 +10,14 @@ let compression = `None
 
 exception Closed
 
-let rec send fd buf offset len =
+let rec send write buf offset len =
   Lwt.catch
-    (fun () -> Lwt_bytes.write fd buf offset len >>= Lwt.return_ok)
+    (fun () -> write buf offset len >>= Lwt.return_ok)
     Lwt.return_error
   >>= function
   | Ok len' ->
       Log.debug (fun m -> m "Wrote %d to fd" len');
-      if len' < len then send fd buf (offset + len') (len - len')
+      if len' < len then (send[@tailcall]) write buf (offset + len') (len - len')
       else Lwt.return_ok ()
   | Error e ->
       Log.err (fun m -> m "Failed to send %a" Fmt.exn e);
@@ -50,15 +50,13 @@ module Outgoing = struct
   let send t msg =
     if Lwt_switch.is_on t.switch then (
       Log.debug (fun m -> m "Trying to send");
-      let blit dst src ~offset ~len =
-        Lwt_bytes.blit_from_bytes src 0 dst offset len
-      in
+      let write p str len = 
+        p >>>= fun () ->
+        send (Lwt_unix.write t.fd) (Bytes.unsafe_of_string str) 0 len
+      in 
       let main () =
-        let size, cont = Capnp.Codecs.serialize_generator msg blit in
-        let buf = Lwt_bytes.create size in
-        let written = cont buf in
-        assert (written = size);
-        let msg_p = prev_send_wrapper t (fun () -> send t.fd buf 0 size) in
+        let write_p () = Capnp.Codecs.serialize_fold_copyless msg ~compression:`None ~init:(Lwt.return_ok ()) ~f:write in
+        let msg_p = prev_send_wrapper t write_p in
         let p = Lwt.choose [ msg_p; t.switch_off_promise ] in
         t.latest_xmit <- p;
         p
@@ -96,7 +94,7 @@ module Incomming = struct
         failwith "Unsupported Cap'n'Proto frame received"
     | Error Capnp.Codecs.FramingError.Incomplete ->
         Log.debug (fun f -> f "Incomplete; waiting for more data...");
-        Lwt_condition.wait t.recv_cond >>= fun () -> recv t
+        Lwt_condition.wait t.recv_cond >>= fun () -> (recv[@tailcall]) t
 
   let recv_thread ?(buf_size = 256) t =
     let handler recv_buffer len =
@@ -125,7 +123,7 @@ module Incomming = struct
       | Ok len -> (
           Log.debug (fun m -> m "Recieved data from socket");
           match handler recv_buffer len with
-          | Ok () -> loop ()
+          | Ok () -> (loop[@tailcall]) ()
           | Error `EOF ->
               Log.debug (fun m -> m "Connection closed with EOF");
               Lwt_switch.(

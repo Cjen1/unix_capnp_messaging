@@ -101,7 +101,7 @@ let rec read_exactly fd buf offset len =
   >>= function
   | 0 -> Lwt.fail EOF
   | read when read = len -> Lwt.return ()
-  | read -> read_exactly fd buf (offset + read) (len - offset)
+  | read -> (read_exactly [@tailcall]) fd buf (offset + read) (len - offset)
 
 let get_id_from_sock sock =
   let buf = Bytes.create 8 in
@@ -113,7 +113,7 @@ let recv_handler_wrapper t conn_descr () =
     Sockets.Incomming.recv conn_descr.in_socket >>>= fun msg ->
     Log.debug (fun m -> m "%a: Handling msg" Fmt.int64 t.node_id);
     Lwt.catch (fun () -> t.handler t conn_descr.node_id msg) Lwt.return_error
-    >>>= fun () -> recv_loop ()
+    >>>= fun () -> (recv_loop [@tailcall]) ()
   in
   recv_loop () >|= function
   | Ok () -> Fmt.failwith "Recv loop exited unexpectedly"
@@ -136,7 +136,7 @@ let rec add_conn t socket id kind =
   ( match kind with
   | `Persistant addr ->
       Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
-          add_outgoing t id addr kind)
+          (add_outgoing [@tailcall]) t id addr kind)
   | `Ephemeral -> Lwt.return_unit )
   >>= fun () ->
   Lwt.both
@@ -164,8 +164,9 @@ and add_outgoing t id addr kind =
           let buf = Bytes.create 8 in
           Bytes.set_int64_be buf 0 t.node_id;
           let buf = Lwt_bytes.of_bytes buf in
-          Sockets.send socket buf 0 8 >>>= fun () ->
-          add_conn t socket id kind >>= Lwt.return_ok
+          Sockets.send (Lwt_bytes.write socket) buf 0 8 >>>= fun () ->
+          Lwt.async (fun () -> (add_conn [@tailcall]) t socket id kind);
+          Lwt.return_ok ()
       | false -> Lwt.return_ok ()
     in
     main >>= function
@@ -257,7 +258,7 @@ let accept_incomming_loop t addr () =
             Lwt.return_unit
       in
       Lwt.async handler;
-      accept_loop ()
+      (accept_loop [@tailcall]) ()
     in
     accept_loop ()
   in
@@ -304,15 +305,14 @@ let send ?(semantics = `AtMostOnce) t id msg =
       | Ok v -> Lwt.return v
       | Error exn ->
           handle_err exn;
-          loop ()
+          (loop [@tailcall]) ()
     in
     loop ()
   in
   let send () =
     match List.assoc_opt id t.active_conns with
     | None -> Lwt.return_error Not_found
-    | Some conn_descr ->
-        Sockets.Outgoing.send conn_descr.out_socket msg
+    | Some conn_descr -> Sockets.Outgoing.send conn_descr.out_socket msg
   in
   match semantics with
   | `AtMostOnce -> send ()
