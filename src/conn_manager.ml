@@ -17,11 +17,11 @@ let addr_of_string s =
       | None -> Error (`Msg (Fmt.str "Port (%s) is not a valid int" port)) )
   | _ -> Error (`Msg (Fmt.str "Expected address of the form ip:port, not %s" s))
 
-module Utils = struct
-  let pp_addr f = function
-    | Unix s -> Fmt.pf f "unix:%s" s
-    | TCP (s, p) -> Fmt.pf f "tcp://%s:%d" s p
+let pp_addr f = function
+  | Unix s -> Fmt.pf f "unix:%s" s
+  | TCP (s, p) -> Fmt.pf f "tcp://%s:%d" s p
 
+module Utils = struct
   let addr_of_host host =
     match Unix.gethostbyname host with
     | exception Not_found -> Fmt.failwith "Unknown host %S" host
@@ -158,7 +158,7 @@ and add_outgoing t id addr kind =
     let main =
       match Lwt_switch.is_on t.switch with
       | true ->
-          Log.info (fun m -> m "Attempting to connect to %a" Utils.pp_addr addr);
+          Log.info (fun m -> m "Attempting to connect to %a" pp_addr addr);
           let connect () = Utils.connect_socket addr >>= Lwt.return_ok in
           Lwt.catch connect Lwt.return_error >>>= fun socket ->
           let buf = Bytes.create 8 in
@@ -304,8 +304,9 @@ let send ?(semantics = `AtMostOnce) t id msg =
       f () >>= function
       | Ok v -> Lwt.return v
       | Error Sockets.Closed ->
-        Log.debug (fun m -> m "%a: Failed to send on closed socket" Fmt.int64 t.node_id);
-        Lwt.return ()
+          Log.debug (fun m ->
+              m "%a: Failed to send on closed socket" Fmt.int64 t.node_id);
+          Lwt.return ()
       | Error exn ->
           handle_err exn;
           (loop [@tailcall]) ()
@@ -321,6 +322,8 @@ let send ?(semantics = `AtMostOnce) t id msg =
   | `AtMostOnce -> send ()
   | `AtLeastOnce ->
       let err_handler exn =
-        Log.err (fun m -> m "%a: Failed to send message with %a" Fmt.int64 t.node_id Fmt.exn exn)
+        Log.err (fun m ->
+            m "%a: Failed to send message with %a" Fmt.int64 t.node_id Fmt.exn
+              exn)
       in
       retry_loop err_handler send >>= fun res -> Lwt.return_ok res

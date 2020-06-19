@@ -1,4 +1,4 @@
-open Library
+open Unix_capnp_messaging
 open Conn_manager
 open Lwt.Infix
 
@@ -27,12 +27,11 @@ let addr i = TCP ("127.0.0.1", 5000 + i)
 let mgr i handler =
   create ~listen_address:(addr i) ~node_id:(Int64.of_int i) handler
 
-let time_it f = 
+let time_it f =
   let start = Unix.gettimeofday () in
-  f () >>= fun () ->
-  Unix.gettimeofday () -. start |> Lwt.return
+  f () >>= fun () -> Unix.gettimeofday () -. start |> Lwt.return
 
-let throughput n () = 
+let throughput n () =
   Log.info (fun m -> m "Setting up throughput test");
   let ops = List.init n (fun _ -> test_message |> of_store) in
   let m1 = mgr 1 (fun t src msg -> send ~semantics:`AtLeastOnce t src msg) in
@@ -40,21 +39,22 @@ let throughput n () =
   add_outgoing m2 (Int64.of_int 1) (addr 1) (`Persistant (addr 1)) >>= fun () ->
   let stream = Lwt_stream.of_list ops in
   let max_concurrency = 100 in
-  let test () = 
-    Lwt_stream.iter_n ~max_concurrency (fun msg -> 
-        send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) msg
-        >>= function 
+  let test () =
+    Lwt_stream.iter_n ~max_concurrency
+      (fun msg ->
+        send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) msg >>= function
         | Error exn -> Fmt.failwith "Failed during throughput %a" Fmt.exn exn
-        | Ok () -> Lwt.return_unit
-      ) stream
-  in 
+        | Ok () -> Lwt.return_unit)
+      stream
+  in
   Log.info (fun m -> m "Starting throughput test");
-  time_it test >>= fun time -> 
+  time_it test >>= fun time ->
   Log.info (fun m -> m "Closing managers");
-  Lwt.join [close m1; close m2]
-  >>= fun () -> 
+  Lwt.join [ close m1; close m2 ] >>= fun () ->
   Log.info (fun m -> m "Finished throughput test!");
-  Fmt.str "Took %f to do %d operations: %f ops/s" time n Core.Float.((of_int n) / time) |> Lwt.return
+  Fmt.str "Took %f to do %d operations: %f ops/s" time n
+    Core.Float.(of_int n / time)
+  |> Lwt.return
 
 let reporter =
   let open Core in

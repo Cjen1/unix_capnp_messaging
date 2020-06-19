@@ -1,4 +1,4 @@
 (library
- (name library)
- (libraries base lwt lwt.unix logs.lwt logs.fmt fmt.tty capnp hex)
-)
+ (name unix_capnp_messaging)
+ (public_name unix_capnp_messaging)
+ (libraries lwt lwt.unix logs.lwt logs.fmt fmt.tty capnp))

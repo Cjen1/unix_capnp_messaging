@@ -9,6 +9,9 @@ type address = Unix of string | TCP of (string * int)
 (* constructs an address for a given string *)
 val addr_of_string : string -> (address, [> `Msg of string ]) result
 
+(* pretty printer for addresses *)
+val pp_addr : Format.formatter -> address -> unit
+
 (* Connection manager *)
 type t
 
@@ -16,7 +19,10 @@ type node_id = int64
 
 (* Handler type for listeners *)
 type recv_handler =
-  t -> node_id -> Capnp.MessageSig.ro Capnp.BytesMessage.Message.t -> (unit, exn) Lwt_result.t
+  t ->
+  node_id ->
+  Capnp.MessageSig.ro Capnp.BytesMessage.Message.t ->
+  (unit, exn) Lwt_result.t
 
 (* Creates a new connection manager listening on [listen_address] with id: [node_id] *)
 val create :

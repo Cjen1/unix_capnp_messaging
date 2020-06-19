@@ -1,5 +1,5 @@
 open Lwt.Infix
-open Library
+open Unix_capnp_messaging
 open Sockets
 
 let of_store, to_store =
@@ -35,7 +35,8 @@ let test_of_to_store () =
 let test_loop _ () =
   let fd1, fd2 = Lwt_unix.pipe () in
   let switch = Lwt_switch.create () in
-  Lwt.both (Incomming.create ~switch fd1) (Outgoing.create ~switch fd2) >>= fun (ins, out) ->
+  Lwt.both (Incomming.create ~switch fd1) (Outgoing.create ~switch fd2)
+  >>= fun (ins, out) ->
   test_message |> of_store |> Outgoing.send out |> exn_handler >>= fun () ->
   Lwt.choose [ timeout 1.; Incomming.recv ins ] >>= fun msg ->
   let ( >>>= ) = Result.bind in
@@ -99,7 +100,7 @@ let test_closed_switch _ () =
   Lwt.both (Incomming.create ~switch fd1) (Outgoing.create ~switch fd2)
   >>= fun (ins, out) ->
   Lwt_switch.turn_off switch >>= fun () ->
-  (test_message |> of_store |> Outgoing.send out) >>= fun tmp ->
+  test_message |> of_store |> Outgoing.send out >>= fun tmp ->
   test_lwt_result "Send on closed outgoing" Sockets.Closed tmp;
   Incomming.recv ins
   >|= test_lwt_result "Recv on closed incommming" Sockets.Closed
@@ -109,7 +110,7 @@ let test_closed_fd _ () =
   let switch = Lwt_switch.create () in
   Lwt.both (Incomming.create fd1) (Outgoing.create fd2) >>= fun (ins, out) ->
   Lwt_unix.close fd1 >>= fun () ->
-  (test_message |> of_store |> Outgoing.send out) >>= fun tmp ->
+  test_message |> of_store |> Outgoing.send out >>= fun tmp ->
   test_lwt_result "Send on closed outgoing" Sockets.Closed tmp;
   Incomming.recv ins
   >|= test_lwt_result "Recv on closed incommming" Sockets.Closed
@@ -136,7 +137,11 @@ let reporter =
 let () =
   Logs.(set_level (Some Debug));
   Logs.set_reporter reporter;
-  let _ = Sys.signal Sys.sigpipe (Sys.Signal_handle (fun _ -> raise @@ Unix.Unix_error (Unix.EPIPE, "", ""))) in
+  let _ =
+    Sys.signal Sys.sigpipe
+      (Sys.Signal_handle
+         (fun _ -> raise @@ Unix.Unix_error (Unix.EPIPE, "", "")))
+  in
   let open Alcotest_lwt in
   Lwt_main.run
   @@ run "Socket test"
