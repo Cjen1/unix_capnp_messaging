@@ -157,17 +157,27 @@ and add_outgoing t id addr kind =
   let rec retry_loop () =
     let main =
       match Lwt_switch.is_on t.switch with
-      | true ->
-          Log.info (fun m -> m "Attempting to connect to %a" pp_addr addr);
-          let connect () = Utils.connect_socket addr >>= Lwt.return_ok in
-          Lwt.catch connect Lwt.return_error >>>= fun socket ->
-          let buf = Bytes.create 8 in
-          Bytes.set_int64_be buf 0 t.node_id;
-          let buf = Lwt_bytes.of_bytes buf in
-          Sockets.send (Lwt_bytes.write socket) buf 0 8 >>>= fun () ->
-          Lwt.async (fun () -> (add_conn [@tailcall]) t socket id kind);
-          Lwt.return_ok ()
       | false -> Lwt.return_ok ()
+      | true -> (
+          let socket_switch = Lwt_switch.create () in
+          let setup_socket =
+            Log.info (fun m -> m "Attempting to connect to %a" pp_addr addr);
+            let connect () = Utils.connect_socket addr >>= Lwt.return_ok in
+            Lwt.catch connect Lwt.return_error >>>= fun socket ->
+            Lwt_switch.add_hook (Some socket_switch) (fun () ->
+                Lwt_unix.close socket);
+            let buf = Bytes.create 8 in
+            Bytes.set_int64_be buf 0 t.node_id;
+            let buf = Lwt_bytes.of_bytes buf in
+            Sockets.send (Lwt_bytes.write socket) buf 0 8 >>>= fun () ->
+            Lwt.async (fun () -> (add_conn [@tailcall]) t socket id kind);
+            Lwt.return_ok ()
+          in
+          setup_socket >>= function
+          | Ok () -> Lwt.return_ok ()
+          | Error exn ->
+              Lwt_switch.turn_off socket_switch >>= fun () ->
+              Lwt.return_error exn )
     in
     main >>= function
     | _ when not (Lwt_switch.is_on t.switch) ->
@@ -228,16 +238,17 @@ let incomming_conn_handler t client_sock =
       add_conn t client_sock id `Ephemeral >>= Lwt.return_ok
 
 let accept_incomming_loop t addr () =
+  let accept_switch = Lwt_switch.create () in
   let main () =
     let create_sock () =
       Utils.bind_socket addr >>= fun fd ->
+      Lwt_switch.add_hook (Some accept_switch) (fun () -> Lwt_unix.close fd);
       Lwt_unix.listen fd 128;
       Lwt.return_ok fd
     in
     Lwt.catch create_sock (fun exn -> Lwt.return_error (`Exn (`Create, exn)))
     >>>= fun bound_socket ->
-    Lwt_switch.add_hook_or_exec (Some t.switch) (fun () ->
-        Lwt_unix.close bound_socket)
+    Lwt_switch.add_hook_or_exec (Some t.switch) (fun () -> Lwt_switch.turn_off accept_switch)
     >>= fun () ->
     let rec accept_loop () =
       let accept () =
@@ -262,7 +273,9 @@ let accept_incomming_loop t addr () =
     in
     accept_loop ()
   in
-  main () >>= function
+  main () >>= fun v -> 
+  Lwt_switch.turn_off accept_switch >>= fun () ->
+  match v with
   | Ok () -> Fmt.failwith "accept loop ended unexpectedly"
   | Error `Closed ->
       Log.debug (fun m -> m "%a: Accept loop closed" Fmt.int64 t.node_id)
@@ -299,31 +312,35 @@ let close t =
   Lwt_main.yield () >>= fun () -> Lwt_switch.turn_off t.switch
 
 let send ?(semantics = `AtMostOnce) t id msg =
-  let retry_loop handle_err f =
+  let err_handler = function
+    | Ok () -> ()
+    | Error exn ->
+        Log.err (fun m ->
+            m "%a: Failed to send message with %a" Fmt.int64 t.node_id Fmt.exn
+              exn)
+  in
+  let retry_loop send =
     let rec loop () =
-      f () >>= function
+      send () >>= function
       | Ok v -> Lwt.return v
       | Error Sockets.Closed ->
           Log.debug (fun m ->
               m "%a: Failed to send on closed socket" Fmt.int64 t.node_id);
           Lwt.return ()
       | Error exn ->
-          handle_err exn;
+          err_handler (Error exn);
           (loop [@tailcall]) ()
     in
     loop ()
   in
   let send () =
     match List.assoc_opt id t.active_conns with
-    | None -> Lwt.return_error Not_found
+    | None ->
+        Lwt.return_error
+          (Invalid_argument
+             (Fmt.str "Not found %a in active_conns" Fmt.int64 id))
     | Some conn_descr -> Sockets.Outgoing.send conn_descr.out_socket msg
   in
   match semantics with
-  | `AtMostOnce -> send ()
-  | `AtLeastOnce ->
-      let err_handler exn =
-        Log.err (fun m ->
-            m "%a: Failed to send message with %a" Fmt.int64 t.node_id Fmt.exn
-              exn)
-      in
-      retry_loop err_handler send >>= fun res -> Lwt.return_ok res
+  | `AtMostOnce -> send () >|= err_handler >>= Lwt.return_ok
+  | `AtLeastOnce -> retry_loop send >>= fun res -> Lwt.return_ok res
