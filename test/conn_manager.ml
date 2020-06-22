@@ -25,12 +25,14 @@ let addr i = TCP ("127.0.0.1", 5000 + i)
 let mgr i handler =
   create ~listen_address:(addr i) ~node_id:(Int64.of_int i) handler
 
-let timeout t f =
+let echo_mgr i = mgr i (send ~semantics:`AtLeastOnce)
+
+let timeout t f s =
   let p = f () >>= Lwt.return_ok in
   let t = Lwt_unix.sleep t >>= Lwt.return_error in
   Lwt.choose [ p; t ] >>= function
   | Ok v -> Lwt.return v
-  | Error () -> Alcotest.fail "timed out"
+  | Error () -> Alcotest.fail s
 
 let test_one_way () =
   let p, f = Lwt.task () in
@@ -54,7 +56,7 @@ let test_one_way () =
       close m1 >>= fun () -> close m2
 
 let test_loop () =
-  let m1 = mgr 1 (fun t src msg -> send ~semantics:`AtLeastOnce t src msg) in
+  let m1 = echo_mgr 1 in
   let p, f = Lwt.task () in
   let m2 =
     mgr 2 (fun _ src msg ->
@@ -131,7 +133,39 @@ let test_recv_exception () =
   | Error exn -> Alcotest.fail (Fmt.str "Sending failed with %a" Fmt.exn exn)
   | Ok () -> Lwt.return_unit
 
-let test_wrapper f _ () = timeout 1. f
+let stream_mgr i =
+  let stream, push = Lwt_stream.create () in
+  (mgr i (fun _ src msg -> push (Some (src, msg)) |> Lwt.return_ok), stream)
+
+let test_mutual () =
+  let m1, str1 = stream_mgr 1 in
+  let m2, str2 = stream_mgr 2 in
+  add_outgoing m1 (Int64.of_int 2) (addr 2) (`Persistant (addr 2)) >>= fun () ->
+  send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) (of_store test_message)
+  >>= function
+  | Error exn ->
+      Alcotest.fail (Fmt.str "Initial message failed with %a" Fmt.exn exn)
+  | Ok () -> (
+      Lwt_stream.next str1 >>= fun _ ->
+      Logs.debug (fun m -> m "Sent and received from m2 -> m1");
+      Logs.debug (fun m -> m "Reordering connection");
+      add_outgoing m2 (Int64.of_int 1) (addr 1) (`Persistant (addr 1))
+      >>= fun () ->
+      Lwt_unix.sleep 1. >>= fun () ->
+      let sends =
+        send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) (of_store test_message)
+        >>>= fun () ->
+        send ~semantics:`AtLeastOnce m1 (Int64.of_int 2) (of_store test_message)
+      in
+      sends >>= function
+      | Error exn ->
+          Alcotest.fail
+            (Fmt.str "Failed to send reinit messages %a" Fmt.exn exn)
+      | Ok () ->
+          Lwt_stream.next str1 >>= fun _ ->
+          Lwt_stream.next str2 >>= fun _ -> Lwt.join [ close m1; close m2 ] )
+
+let test_wrapper f _ () = timeout 5. f "Timed out"
 
 let reporter =
   let open Core in
@@ -155,7 +189,7 @@ let () =
   Logs.(set_level (Some Debug));
   Logs.set_reporter reporter;
   let debug = false in
-  if debug then Lwt_main.run (test_one_way () >>= fun () -> test_loop ())
+  if debug then Lwt_main.run (test_mutual ())
   else
     let open Alcotest_lwt in
     Lwt_main.run
@@ -165,6 +199,7 @@ let () =
              [
                test_case "One Way" `Quick (test_wrapper test_one_way);
                test_case "Loopback" `Quick (test_wrapper test_loop);
+               test_case "Mutual" `Quick (test_wrapper test_mutual);
              ] );
            ( "Failure",
              [
