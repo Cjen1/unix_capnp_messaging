@@ -62,6 +62,10 @@ module Utils = struct
         let socket = Lwt_unix.of_unix_file_descr socket in
         Lwt_unix.bind socket (Unix.ADDR_INET (addr_of_host host, port))
         >|= fun () -> socket
+
+  let print_and_ignore src exn =
+    Log.err (fun m -> m "Caught %a in %s" Fmt.exn exn src);
+    Lwt.return_unit
 end
 
 type node_id = int64
@@ -73,7 +77,7 @@ type conn_descr = {
   in_socket : Sockets.Incomming.t;
   out_socket : Sockets.Outgoing.t;
   switch : Lwt_switch.t;
-  mutable kind : conn_kind;
+  kind : conn_kind;
 }
 
 type recv_handler =
@@ -85,7 +89,7 @@ type recv_handler =
 and t = {
   handler : recv_handler;
   mutable active_conns : (node_id * conn_descr) list;
-  mutable persist_ids : (node_id * conn_kind) list;
+  mutable persist_ids : (node_id * address) list;
   switch : Lwt_switch.t;
   switch_off_prom_fulfill : unit Lwt.t * unit Lwt.u;
   retry_connection_timeout : float;
@@ -122,36 +126,68 @@ let recv_handler_wrapper t conn_descr () =
   | Error exn ->
       Log.err (fun m -> m "Recv loop exited with exn: %a" Fmt.exn exn)
 
-let rec add_conn t socket id kind =
-  let switch = Lwt_switch.create () in
-  Lwt.join
-    [
-      Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
-          t.active_conns <- List.remove_assoc id t.active_conns;
-          Lwt.return_unit);
-      Lwt_switch.add_hook_or_exec (Some t.switch) (fun () ->
-          Lwt_switch.turn_off switch >>= fun () -> Lwt_unix.close socket);
-    ]
+let conn_from_fd ?switch ?incomming ?outgoing fd id kind =
+  let switch = match switch with Some v -> v | None -> Lwt_switch.create () in
+  let ip =
+    match incomming with
+    | Some v -> Lwt.return v
+    | None -> Sockets.Incomming.create ~switch fd
+  in
+  let op =
+    match outgoing with
+    | Some v -> Lwt.return v
+    | None -> Sockets.Outgoing.create ~switch fd
+  in
+  Lwt.both ip op >|= fun (in_socket, out_socket) ->
+  { node_id = id; in_socket; out_socket; switch; kind }
+
+(* Adds connection to active conns *)
+let rec add_conn t (conn_descr : conn_descr) =
+  Lwt_switch.add_hook_or_exec (Some t.switch) (fun () ->
+      Lwt_switch.turn_off conn_descr.switch)
   >>= fun () ->
-  ( match kind with
-  | `Persistant addr ->
-      Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
-          (add_outgoing [@tailcall]) t id addr kind)
-  | `Ephemeral -> Lwt.return_unit )
-  >>= fun () ->
-  Lwt.both
-    (Sockets.Incomming.create ~switch socket)
-    (Sockets.Outgoing.create ~switch socket)
-  >|= fun (in_socket, out_socket) ->
-  let conn_descr = { node_id = id; in_socket; out_socket; switch; kind } in
-  t.active_conns <- (id, conn_descr) :: t.active_conns;
+  t.active_conns <- (conn_descr.node_id, conn_descr) :: t.active_conns;
   Log.debug (fun m ->
-      m "%a: Added %a to active connections" Fmt.int64 t.node_id Fmt.int64 id);
+      m "%a: Added %a to active connections" Fmt.int64 t.node_id Fmt.int64
+        conn_descr.node_id);
   Lwt.async (recv_handler_wrapper t conn_descr);
-  match kind with
-  | `Persistant _ as kind when List.mem_assoc id t.persist_ids ->
-      t.persist_ids <- (id, kind) :: t.persist_ids
-  | _ -> ()
+  match conn_descr.kind with
+  | `Persistant addr ->
+      if not @@ List.mem_assoc conn_descr.node_id t.persist_ids then
+        t.persist_ids <- (conn_descr.node_id, addr) :: t.persist_ids;
+      Lwt_switch.add_hook_or_exec (Some conn_descr.switch) (fun () ->
+          add_outgoing t conn_descr.node_id addr conn_descr.kind)
+  | _ -> Lwt.return_unit
+
+(* Handles if there are two connections at once *)
+and handle_new_conn t (new_conn : conn_descr) =
+  let other_id = new_conn.node_id in
+  let new_conn =
+    match List.assoc_opt other_id t.persist_ids with
+    | Some addr -> { new_conn with kind = `Persistant addr }
+    | None -> new_conn
+  in
+  match List.assoc_opt other_id t.active_conns with
+  | Some _ when t.node_id > other_id ->
+      Log.debug (fun m ->
+          m "Preexisting conn from %a and we initiate => kill new" Fmt.int64
+            other_id);
+      Lwt.catch
+        (fun () -> Lwt_switch.turn_off new_conn.switch)
+        (Utils.print_and_ignore "handle new conn")
+  | Some existing_conn ->
+      Log.debug (fun m ->
+          m "Preexisting conn from %a and they initiate, => kill old" Fmt.int64
+            other_id);
+      t.active_conns <- List.remove_assoc other_id t.active_conns;
+      add_conn t new_conn >>= fun () ->
+      Lwt.catch
+        (fun () -> Lwt_switch.turn_off existing_conn.switch)
+        (Utils.print_and_ignore "handle new conn")
+  | None ->
+      Log.debug (fun m ->
+          m "%a: Got connection from %a" Fmt.int64 t.node_id Fmt.int64 other_id);
+      add_conn t new_conn
 
 and add_outgoing t id addr kind =
   let rec retry_loop () =
@@ -170,8 +206,8 @@ and add_outgoing t id addr kind =
             Bytes.set_int64_be buf 0 t.node_id;
             let buf = Lwt_bytes.of_bytes buf in
             Sockets.send (Lwt_bytes.write socket) buf 0 8 >>>= fun () ->
-            Lwt.async (fun () -> (add_conn [@tailcall]) t socket id kind);
-            Lwt.return_ok ()
+            conn_from_fd socket ~switch:socket_switch id kind >>= fun descr ->
+            handle_new_conn t descr >>= Lwt.return_ok
           in
           setup_socket >>= function
           | Ok () -> Lwt.return_ok ()
@@ -196,99 +232,61 @@ and add_outgoing t id addr kind =
   in
   retry_loop ()
 
-let incomming_conn_handler t client_sock =
-  get_id_from_sock client_sock >>>= fun id ->
-  Log.debug (fun m ->
-      m "%a: Completed handshake with %a" Fmt.int64 t.node_id Fmt.int64 id);
-  match (List.assoc_opt id t.persist_ids, List.assoc_opt id t.active_conns) with
-  | Some _kind, Some _conn when t.node_id > id ->
-      Log.debug (fun m ->
-          m "Preexisting conn from %d and we should initiate" (Int64.to_int id));
-      Lwt.catch
-        (fun () -> Lwt_unix.close client_sock >>= fun () -> Lwt.return_ok ())
-        Lwt.return_error
-  | Some kind, Some conn ->
-      Log.debug (fun m ->
-          m
-            "Preexisting conn from %a and they initiate, thus stop existing, \
-             add new"
-            Fmt.int64 id);
-      Lwt.async (fun () -> Lwt_switch.turn_off conn.switch);
-      t.active_conns <- List.remove_assoc id t.active_conns;
-      add_conn t client_sock id kind >>= Lwt.return_ok
-  | None, Some conn ->
-      Log.debug (fun m ->
-          m
-            "Preexisting conn from %a and they initiate, thus stop existing, \
-             add new"
-            Fmt.int64 id);
-      Lwt.async (fun () -> Lwt_switch.turn_off conn.switch);
-      t.active_conns <- List.remove_assoc id t.active_conns;
-      add_conn t client_sock id `Ephemeral >>= Lwt.return_ok
-  | Some _kind, None ->
-      Log.debug (fun m ->
-          m
-            "Persistant connection but not yet established, will be \
-             established later");
-      Lwt.return_ok ()
-  | None, None ->
-      Log.debug (fun m ->
-          m "%a: Got Ephemeral connection from %a" Fmt.int64 t.node_id Fmt.int64
-            id);
-      add_conn t client_sock id `Ephemeral >>= Lwt.return_ok
-
 let accept_incomming_loop t addr () =
-  let accept_switch = Lwt_switch.create () in
+  let bound_switch = Lwt_switch.create () in
   let main () =
     let create_sock () =
       Utils.bind_socket addr >>= fun fd ->
-      Lwt_switch.add_hook (Some accept_switch) (fun () -> Lwt_unix.close fd);
+      Lwt_switch.add_hook (Some bound_switch) (fun () -> Lwt_unix.close fd);
       Lwt_unix.listen fd 128;
       Lwt.return_ok fd
     in
     Lwt.catch create_sock (fun exn -> Lwt.return_error (`Exn (`Create, exn)))
     >>>= fun bound_socket ->
-    Lwt_switch.add_hook_or_exec (Some t.switch) (fun () -> Lwt_switch.turn_off accept_switch)
+    Lwt_switch.add_hook_or_exec (Some t.switch) (fun () ->
+        Lwt_switch.turn_off bound_switch)
     >>= fun () ->
     let rec accept_loop () =
-      let accept () =
-        let off =
-          fst t.switch_off_prom_fulfill >>= fun () -> Lwt.return_error `Closed
-        in
-        let acc = Lwt_unix.accept bound_socket >>= Lwt.return_ok in
-        Lwt.choose [ off; acc ]
-      in
-      Lwt.catch accept (fun exn -> Lwt.return_error (`Exn (`Accept, exn)))
+      let accept_switch = Lwt_switch.create () in
+      Lwt.catch 
+        (fun () -> Lwt_unix.accept bound_socket >>= Lwt.return_ok) 
+        (fun exn -> Lwt.return_error (`Exn (`Accept, exn)))
       >>>= fun (client_sock, _) ->
       let handler () =
-        incomming_conn_handler t client_sock >>= function
-        | Ok () -> Lwt.return_unit
-        | Error exn ->
-            Log.err (fun m ->
-                m "Incomming connection handler threw error %a" Fmt.exn exn);
-            Lwt.return_unit
-      in
+        let main = 
+          get_id_from_sock client_sock >>= function
+          | Error exn -> (
+              Log.err (fun m -> m "Couldn't get id from sock %a" Fmt.exn exn);
+              Lwt.return_unit)
+          | Ok id ->
+            conn_from_fd ~switch:accept_switch client_sock id `Ephemeral 
+            >>= fun descr ->
+            handle_new_conn t descr
+        in main
+      in 
       Lwt.async handler;
       (accept_loop [@tailcall]) ()
     in
     accept_loop ()
   in
-  main () >>= fun v -> 
-  Lwt_switch.turn_off accept_switch >>= fun () ->
+  main () >>= fun v ->
+  Lwt_switch.turn_off bound_switch >>= fun () ->
   match v with
+  | _ when not @@ Lwt_switch.is_on t.switch -> Lwt.return_unit
   | Ok () -> Fmt.failwith "accept loop ended unexpectedly"
   | Error `Closed ->
-      Log.debug (fun m -> m "%a: Accept loop closed" Fmt.int64 t.node_id)
-      |> Lwt.return
+    Log.debug (fun m -> m "%a: Accept loop closed" Fmt.int64 t.node_id);
+    Lwt.return_unit
   | Error (`Exn (`Create, exn)) ->
-      Log.err (fun m ->
-          m "Accept loop failed during socket creation with %a" Fmt.exn exn)
-      |> Lwt.return
+    Log.err (fun m ->
+        m "Accept loop failed during socket creation with %a" Fmt.exn exn);
+    Lwt.return_unit
   | Error (`Exn (`Accept, exn)) ->
-      Log.err (fun m ->
-          m "Accept loop failed while accepting a connection with %a" Fmt.exn
-            exn)
-      |> Lwt.return
+    Log.err (fun m ->
+        m "Accept loop failed while accepting a connection with %a" Fmt.exn
+          exn);
+    Lwt.return_unit
+  | Error _ -> Fmt.failwith "Unknown tag encountered in accept loop"
 
 let create ?(retry_connection_timeout = 10.) ~listen_address ~node_id handler =
   let switch = Lwt_switch.create () in
