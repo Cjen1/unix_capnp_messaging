@@ -48,14 +48,31 @@ module Outgoing = struct
   let send t msg =
     if Lwt_switch.is_on t.switch then (
       Log.debug (fun m -> m "Trying to send");
-      let write p str len =
-        p >>>= fun () ->
-        send (Lwt_unix.write t.fd) (Bytes.unsafe_of_string str) 0 len
-      in
       let main () =
+        (*
+        let write p str len =
+          p >>>= fun () ->
+          send (Lwt_unix.write t.fd) (Bytes.unsafe_of_string str) 0 len
+        in
+           *)
+        let write (io,written) str len = 
+          Lwt_unix.IO_vectors.append_bytes io (Bytes.unsafe_of_string str) 0 len;
+          io, len + written
+        in 
         let write_p () =
+          (*
+          let buf = Capnp.Codecs.serialize ~compression:`None msg |> Bytes.unsafe_of_string in
+          send (Lwt_unix.write t.fd) buf 0 (Bytes.length buf)
+             *)
+          (*
           Capnp.Codecs.serialize_fold_copyless msg ~compression:`None
             ~init:(Lwt.return_ok ()) ~f:write
+             *)
+          let io_vec, expected_size = Capnp.Codecs.serialize_fold_copyless msg ~compression:`None
+              ~init:(Lwt_unix.IO_vectors.create (), 0) ~f:write
+          in Lwt_unix.writev t.fd io_vec >>= function 
+          | i when i = expected_size -> Lwt.return_ok ()
+          | _ -> Lwt.return_error Not_found
         in
         let msg_p = prev_send_wrapper t write_p in
         let p = Lwt.choose [ msg_p; t.switch_off_promise ] in
