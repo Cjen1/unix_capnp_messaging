@@ -110,7 +110,7 @@ let test_recv_exception () =
     let p, f = Lwt.task () in
     let m1 =
       mgr 1 (fun _ src _msg ->
-          if src == Int64.of_int 2 then raise Not_found else Lwt.wakeup f src;
+          if Int64.(src = of_int 2) then raise Not_found else Lwt.wakeup f src;
           Lwt.return_ok ())
     in
     let m2 = mgr 2 (fun _ _ _ -> Lwt.return_ok ()) in
@@ -126,7 +126,7 @@ let test_recv_exception () =
     send ~semantics:`AtLeastOnce m3 (Int64.of_int 1) (of_store test_message)
     >>>= fun () ->
     p >>= fun src ->
-    Alcotest.(check int64) "Received source" src (Int64.of_int 3);
+    Alcotest.(check int64) "Received source" (Int64.of_int 3) src ;
     Lwt.join [ close m1; close m2 ] >>= Lwt.return_ok
   in
   main () >>= function
