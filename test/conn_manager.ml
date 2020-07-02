@@ -42,9 +42,8 @@ let test_one_way () =
         Lwt.return_ok ())
   in
   let m2 = mgr 2 (fun _ _ _ -> Lwt.return_ok ()) in
-  add_outgoing m2 (Int64.of_int 1) (addr 1) (`Persistant (addr 1)) >>= fun () ->
-  send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) (of_store test_message)
-  >>= function
+  add_outgoing m2 Int64.one (addr 1) (`Persistant (addr 1)) >>= fun () ->
+  send ~semantics:`AtLeastOnce m2 Int64.one (of_store test_message) >>= function
   | Error exn -> Alcotest.fail (Fmt.str "Sending failed with %a" Fmt.exn exn)
   | Ok () ->
       p >>= fun (src, msg) ->
@@ -63,9 +62,8 @@ let test_loop () =
         Lwt.wakeup f (src, msg);
         Lwt.return_ok ())
   in
-  add_outgoing m2 (Int64.of_int 1) (addr 1) (`Persistant (addr 1)) >>= fun () ->
-  send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) (of_store test_message)
-  >>= function
+  add_outgoing m2 Int64.one (addr 1) (`Persistant (addr 1)) >>= fun () ->
+  send ~semantics:`AtLeastOnce m2 Int64.one (of_store test_message) >>= function
   | Error exn -> Alcotest.fail (Fmt.str "Sending failed with %a" Fmt.exn exn)
   | Ok () ->
       p >>= fun (src, msg) ->
@@ -73,7 +71,7 @@ let test_loop () =
         "Received message"
         (msg |> to_store |> Bytes.to_string)
         (test_message |> Bytes.to_string);
-      Alcotest.(check int64) "Received source" src (Int64.of_int 1);
+      Alcotest.(check int64) "Received source" src Int64.one;
       close m1 >>= fun () -> close m2
 
 (* Two connections, one of which breaks and the other should still function *)
@@ -89,12 +87,12 @@ let test_conn_failure () =
     let m3 = mgr 3 (fun _ _ _ -> Lwt.return_ok ()) in
     Lwt.join
       [
-        add_outgoing m2 (Int64.of_int 1) (addr 1) (`Persistant (addr 1));
-        add_outgoing m3 (Int64.of_int 1) (addr 1) (`Persistant (addr 1));
+        add_outgoing m2 Int64.one (addr 1) (`Persistant (addr 1));
+        add_outgoing m3 Int64.one (addr 1) (`Persistant (addr 1));
       ]
     >>= fun () ->
     close m3 >>= fun () ->
-    send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) (of_store test_message)
+    send ~semantics:`AtLeastOnce m2 Int64.one (of_store test_message)
     >>>= fun () ->
     p >>= fun src ->
     Alcotest.(check int64) "Received source" src (Int64.of_int 2);
@@ -117,16 +115,16 @@ let test_recv_exception () =
     let m3 = mgr 3 (fun _ _ _ -> Lwt.return_ok ()) in
     Lwt.join
       [
-        add_outgoing m2 (Int64.of_int 1) (addr 1) (`Persistant (addr 1));
-        add_outgoing m3 (Int64.of_int 1) (addr 1) (`Persistant (addr 1));
+        add_outgoing m2 Int64.one (addr 1) (`Persistant (addr 1));
+        add_outgoing m3 Int64.one (addr 1) (`Persistant (addr 1));
       ]
     >>= fun () ->
-    send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) (of_store test_message)
+    send ~semantics:`AtLeastOnce m2 Int64.one (of_store test_message)
     >>>= fun () ->
-    send ~semantics:`AtLeastOnce m3 (Int64.of_int 1) (of_store test_message)
+    send ~semantics:`AtLeastOnce m3 Int64.one (of_store test_message)
     >>>= fun () ->
     p >>= fun src ->
-    Alcotest.(check int64) "Received source" (Int64.of_int 3) src ;
+    Alcotest.(check int64) "Received source" (Int64.of_int 3) src;
     Lwt.join [ close m1; close m2 ] >>= Lwt.return_ok
   in
   main () >>= function
@@ -141,19 +139,17 @@ let test_mutual () =
   let m1, str1 = stream_mgr 1 in
   let m2, str2 = stream_mgr 2 in
   add_outgoing m1 (Int64.of_int 2) (addr 2) (`Persistant (addr 2)) >>= fun () ->
-  send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) (of_store test_message)
-  >>= function
+  send ~semantics:`AtLeastOnce m2 Int64.one (of_store test_message) >>= function
   | Error exn ->
       Alcotest.fail (Fmt.str "Initial message failed with %a" Fmt.exn exn)
   | Ok () -> (
       Lwt_stream.next str1 >>= fun _ ->
       Logs.debug (fun m -> m "Sent and received from m2 -> m1");
       Logs.debug (fun m -> m "Reordering connection");
-      add_outgoing m2 (Int64.of_int 1) (addr 1) (`Persistant (addr 1))
-      >>= fun () ->
+      add_outgoing m2 Int64.one (addr 1) (`Persistant (addr 1)) >>= fun () ->
       Lwt_unix.sleep 1. >>= fun () ->
       let sends =
-        send ~semantics:`AtLeastOnce m2 (Int64.of_int 1) (of_store test_message)
+        send ~semantics:`AtLeastOnce m2 Int64.one (of_store test_message)
         >>>= fun () ->
         send ~semantics:`AtLeastOnce m1 (Int64.of_int 2) (of_store test_message)
       in
@@ -164,6 +160,43 @@ let test_mutual () =
       | Ok () ->
           Lwt_stream.next str1 >>= fun _ ->
           Lwt_stream.next str2 >>= fun _ -> Lwt.join [ close m1; close m2 ] )
+
+(* Throw an exception on one of the receives and the other should succeed *)
+let test_recv_sleep () =
+  let main () =
+    let p, f = Lwt.task () in
+    let m1 =
+      mgr 1 (fun _ _src msg ->
+          let msg = to_store msg in
+          Alcotest.(check int) "Buffer size" 16 (Bytes.length msg);
+          if Bytes.get_int16_le msg 0 = 0 then
+            Lwt_unix.sleep 100. >>= Lwt.return_ok
+          else (
+            Lwt.wakeup f (Bytes.get_int16_le msg 0);
+            Lwt.return_ok () ))
+    in
+    let fail_msg =
+      let buf = Bytes.create 16 in
+      Bytes.set_int16_be buf 0 0;
+      of_store buf
+    in
+    let success_i = 25 in
+    let succeed_msg =
+      let buf = Bytes.create 16 in
+      Bytes.set_int16_le buf 0 success_i;
+      of_store buf
+    in
+    let m2 = mgr 2 (fun _ _ _ -> Lwt.return_ok ()) in
+    add_outgoing m2 Int64.one (addr 1) (`Persistant (addr 1)) >>= fun () ->
+    send ~semantics:`AtLeastOnce m2 Int64.one fail_msg >>>= fun () ->
+    send ~semantics:`AtLeastOnce m2 Int64.one succeed_msg >>>= fun () ->
+    p >>= fun src ->
+    Alcotest.(check int) "Received message" success_i src;
+    Lwt.join [ close m1; close m2 ] >>= Lwt.return_ok
+  in
+  main () >>= function
+  | Error exn -> Alcotest.fail (Fmt.str "Sending failed with %a" Fmt.exn exn)
+  | Ok () -> Lwt.return_unit
 
 let test_wrapper f _ () = timeout 5. f "Timed out"
 
@@ -207,5 +240,6 @@ let () =
                  (test_wrapper test_conn_failure);
                test_case "Exception handler" `Quick
                  (test_wrapper test_recv_exception);
+               test_case "Sleep handler" `Quick (test_wrapper test_recv_sleep);
              ] );
          ]
