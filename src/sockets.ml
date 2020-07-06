@@ -45,34 +45,31 @@ module Outgoing = struct
         Log.debug (fun m -> m "Prev failed");
         failure e
 
+  let write_vec fd v expected_size =
+    let rec loop remaining =
+      Lwt_unix.writev fd v >>= fun written ->
+      if written <> remaining then (
+        Lwt_unix.IO_vectors.drop v written;
+        loop (remaining - written) )
+      else Lwt.return_ok ()
+    in
+    Lwt.catch (fun () -> loop expected_size) Lwt.return_error
+
   let send t msg =
     if Lwt_switch.is_on t.switch then (
       Log.debug (fun m -> m "Trying to send");
       let main () =
-        (*
-        let write p str len =
-          p >>>= fun () ->
-          send (Lwt_unix.write t.fd) (Bytes.unsafe_of_string str) 0 len
-        in
-           *)
-        let write (io,written) str len = 
+        let append_to_vec (io, written) str len =
           Lwt_unix.IO_vectors.append_bytes io (Bytes.unsafe_of_string str) 0 len;
-          io, len + written
-        in 
+          (io, len + written)
+        in
         let write_p () =
-          (*
-          let buf = Capnp.Codecs.serialize ~compression:`None msg |> Bytes.unsafe_of_string in
-          send (Lwt_unix.write t.fd) buf 0 (Bytes.length buf)
-             *)
-          (*
-          Capnp.Codecs.serialize_fold_copyless msg ~compression:`None
-            ~init:(Lwt.return_ok ()) ~f:write
-             *)
-          let io_vec, expected_size = Capnp.Codecs.serialize_fold_copyless msg ~compression:`None
-              ~init:(Lwt_unix.IO_vectors.create (), 0) ~f:write
-          in Lwt_unix.writev t.fd io_vec >>= function 
-          | i when i = expected_size -> Lwt.return_ok ()
-          | _ -> Lwt.return_error Not_found
+          let vec, expected_size =
+            Capnp.Codecs.serialize_fold_copyless msg ~compression:`None
+              ~init:(Lwt_unix.IO_vectors.create (), 0)
+              ~f:append_to_vec
+          in
+          write_vec t.fd vec expected_size
         in
         let msg_p = prev_send_wrapper t write_p in
         let p = Lwt.choose [ msg_p; t.switch_off_promise ] in
