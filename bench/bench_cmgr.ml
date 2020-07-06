@@ -35,7 +35,14 @@ let throughput n () =
   Log.info (fun m -> m "Setting up throughput test");
   let ops = List.init n (fun _ -> test_message |> of_store) in
   let m1 = mgr 1 (fun t src msg -> send ~semantics:`AtLeastOnce t src msg) in
-  let m2 = mgr 2 (fun _ _ _ -> Lwt.return_ok ()) in
+  let count = ref 0 in
+  let finished = Lwt.task () in
+  let m2 =
+    mgr 2 (fun _ _ _ ->
+        count := !count + 1;
+        if !count = n then Lwt.wakeup_later (snd finished) ();
+        Lwt.return_ok ())
+  in
   add_outgoing m2 (Int64.of_int 1) (addr 1) (`Persistant (addr 1)) >>= fun () ->
   let stream = Lwt_stream.of_list ops in
   let max_concurrency = 100 in
@@ -46,6 +53,8 @@ let throughput n () =
         | Error exn -> Fmt.failwith "Failed during throughput %a" Fmt.exn exn
         | Ok () -> Lwt.return_unit)
       stream
+    >>= fun () ->
+    fst finished
   in
   Log.info (fun m -> m "Starting throughput test");
   time_it test >>= fun time ->

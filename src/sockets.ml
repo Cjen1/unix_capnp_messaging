@@ -25,6 +25,7 @@ let rec send write buf offset len =
 module Outgoing = struct
   type t = {
     fd : Lwt_unix.file_descr;
+    mutable ongoing : int;
     mutable latest_xmit : (unit, exn) Lwt_result.t;
     switch_off_promise : (unit, exn) Lwt_result.t;
     switch : Lwt_switch.t;
@@ -39,7 +40,9 @@ module Outgoing = struct
     | Ok () -> (
         Log.debug (fun m -> m "trying to catch f");
         Lwt.catch f Lwt.return_error >>= function
-        | Ok v -> Lwt.return_ok v
+        | Ok v ->
+            t.ongoing <- t.ongoing - 1;
+            Lwt.return_ok v
         | Error e -> failure e )
     | Error e ->
         Log.debug (fun m -> m "Prev failed");
@@ -74,6 +77,7 @@ module Outgoing = struct
         let msg_p = prev_send_wrapper t write_p in
         let p = Lwt.choose [ msg_p; t.switch_off_promise ] in
         t.latest_xmit <- p;
+        t.ongoing <- t.ongoing + 1;
         p
       in
       Lwt.catch main Lwt.return_error )
@@ -89,7 +93,9 @@ module Outgoing = struct
         Lwt.return_unit)
     >>= fun () ->
     let latest_xmit = Lwt.return_ok () in
-    let t = { fd; latest_xmit; switch_off_promise = off_p; switch } in
+    let t =
+      { fd; latest_xmit; ongoing = 0; switch_off_promise = off_p; switch }
+    in
     Lwt.return t
 end
 
@@ -118,6 +124,8 @@ module Incomming = struct
         Capnp.Codecs.FramedStream.add_fragment t.decoder
           (Bytes.unsafe_to_string buf);
         Lwt_condition.broadcast t.recv_cond ();
+        if Capnp.Codecs.FramedStream.bytes_available t.decoder > 2*1024*1024 then
+          Log.err (fun m -> m "Queuing in the recv socket of %d" (Capnp.Codecs.FramedStream.bytes_available t.decoder));
         (* don't need to wipe buffer since will be wiped by Bytes.sub *)
         Ok () )
       else Error `EOF
@@ -138,7 +146,11 @@ module Incomming = struct
       | Ok len -> (
           Log.debug (fun m -> m "Recieved data from socket");
           match handler recv_buffer len with
-          | Ok () -> (loop [@tailcall]) ()
+          | Ok () -> 
+            (
+            if Capnp.Codecs.FramedStream.bytes_available t.decoder > 1024 * 1024 then
+              Lwt_main.yield ()
+            else Lwt.return_unit) >>= fun () -> (loop [@tailcall]) ()
           | Error `EOF ->
               Log.debug (fun m -> m "Connection closed with EOF");
               Lwt_switch.(
