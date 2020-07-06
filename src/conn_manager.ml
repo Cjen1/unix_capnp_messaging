@@ -113,25 +113,28 @@ let get_id_from_sock sock =
   Bytes.get_int64_be buf 0 |> Lwt.return_ok
 
 let recv_handler_wrapper t conn_descr () =
-  let stream = Lwt_stream.from ( fun () ->
-      Sockets.Incomming.recv conn_descr.in_socket >|= function
-      | Ok msg -> Some msg
-      | Error Sockets.Closed -> 
+  let rec loop () =
+    Sockets.Incomming.recv conn_descr.in_socket >>= function
+    | Ok msg ->
+        let p =
+          Lwt.catch
+            (fun () -> t.handler t conn_descr.node_id msg)
+            Lwt.return_error
+          >|= function
+          | Ok () -> ()
+          | Error exn ->
+              Log.err (fun m -> m "Handler failed with %a" Fmt.exn exn)
+        in
+        Lwt.async (fun () -> p);
+        loop ()
+    | Error Sockets.Closed ->
         Log.debug (fun m -> m "%a: Socket closed" Fmt.int64 t.node_id);
-        None
-      | Error exn ->
+        Lwt.return_unit
+    | Error exn ->
         Log.err (fun m -> m "Recv loop exited with exn: %a" Fmt.exn exn);
-        None
-    ) 
+        Lwt.return_unit
   in
-  let handler msg = 
-    Lwt.catch (fun () -> t.handler t conn_descr.node_id msg) Lwt.return_error
-    >|= function
-    | Ok () -> ()
-    | Error exn -> Log.err (fun m -> m "Handler failed with %a" Fmt.exn exn)
-  in 
-  let max_concurrency = 64 in
-  Lwt_stream.iter_n ~max_concurrency handler stream
+  loop ()
 
 let conn_from_fd ?switch ?incomming ?outgoing fd id kind =
   let switch = match switch with Some v -> v | None -> Lwt_switch.create () in
