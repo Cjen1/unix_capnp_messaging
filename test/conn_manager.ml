@@ -102,6 +102,32 @@ let test_conn_failure () =
   | Error exn -> Alcotest.fail (Fmt.str "Sending failed with %a" Fmt.exn exn)
   | Ok () -> Lwt.return_unit
 
+(* Two connections, one of which breaks and the other should still be able to connect *)
+let test_conn_failure_reconnect () =
+  let main () =
+    let p, f = Lwt.task () in
+    let m1 =
+      mgr 1 (fun _ src _msg ->
+          Logs.debug (fun m -> m "Got request from %a" Fmt.int64 src);
+          if src = Int64.of_int 2 then Lwt.wakeup f src;
+          Lwt.return_ok ())
+    in
+    let m2 = mgr 2 (fun _ _ _ -> Lwt.return_ok ()) in
+    let m3 = mgr 3 (fun _ _ _ -> Lwt.return_ok ()) in
+    add_outgoing m3 Int64.one (addr 1) (`Persistant (addr 1)) >>= fun () ->
+    send ~semantics:`AtLeastOnce m3 Int64.one (of_store test_message) >>>= fun () ->
+    close m3 >>= fun () ->
+    add_outgoing m2 Int64.one (addr 1) (`Persistant (addr 1)) >>= fun () ->
+    send ~semantics:`AtLeastOnce m2 Int64.one (of_store test_message)
+    >>>= fun () ->
+    p >>= fun src ->
+    Alcotest.(check int64) "Received source" src (Int64.of_int 2);
+    Lwt.join [ close m1; close m2 ] >>= Lwt.return_ok
+  in
+  main () >>= function
+  | Error exn -> Alcotest.fail (Fmt.str "Sending failed with %a" Fmt.exn exn)
+  | Ok () -> Lwt.return_unit
+
 (* Throw an exception on one of the receives and the other should succeed *)
 let test_recv_exception () =
   let main () =
@@ -238,6 +264,8 @@ let () =
              [
                test_case "Connection failure" `Quick
                  (test_wrapper test_conn_failure);
+               test_case "Connection failure reconnect" `Quick
+                 (test_wrapper test_conn_failure_reconnect);
                test_case "Exception handler" `Quick
                  (test_wrapper test_recv_exception);
                test_case "Sleep handler" `Quick (test_wrapper test_recv_sleep);

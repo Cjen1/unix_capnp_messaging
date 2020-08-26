@@ -1,4 +1,5 @@
 open Lwt.Infix
+module U = Utils
 
 let ( >>>= ) a b = Lwt_result.bind a b
 
@@ -98,18 +99,18 @@ and t = {
 
 exception EOF
 
-let rec read_exactly fd buf offset len =
-  Lwt.catch
+let rec read_exactly fd buf offset len () =
+  U.catch
     (fun () -> Lwt_unix.read fd buf offset len)
     (fun exn -> Lwt.fail exn)
   >>= function
   | 0 -> Lwt.fail EOF
-  | read when read = len -> Lwt.return ()
-  | read -> (read_exactly [@tailcall]) fd buf (offset + read) (len - offset)
+  | read when read = len -> Lwt.return_ok ()
+  | read -> (read_exactly [@tailcall]) fd buf (offset + read) (len - offset) ()
 
 let get_id_from_sock sock =
   let buf = Bytes.create 8 in
-  Lwt_result.catch (read_exactly sock buf 0 8) >>>= fun () ->
+  U.catch (read_exactly sock buf 0 8) Lwt.return_error >>>= fun () ->
   Bytes.get_int64_be buf 0 |> Lwt.return_ok
 
 let recv_handler_wrapper t conn_descr () =
@@ -117,7 +118,7 @@ let recv_handler_wrapper t conn_descr () =
     Sockets.Incomming.recv conn_descr.in_socket >>= function
     | Ok msg ->
         let p =
-          Lwt.catch
+          U.catch
             (fun () -> t.handler t conn_descr.node_id msg)
             Lwt.return_error
           >|= function
@@ -183,7 +184,7 @@ and handle_new_conn t (new_conn : conn_descr) direction =
     Log.debug (fun m ->
         m "Preexisting conn from %a and we initiate => kill new" Fmt.int64
           other_id);
-    Lwt.catch
+    U.catch
       (fun () -> Lwt_switch.turn_off new_conn.switch)
       (Utils.print_and_ignore "handle new conn")
   in
@@ -193,7 +194,7 @@ and handle_new_conn t (new_conn : conn_descr) direction =
           other_id);
     t.active_conns <- List.remove_assoc other_id t.active_conns;
     add_conn t new_conn >>= fun () ->
-    Lwt.catch
+    U.catch
       (fun () -> Lwt_switch.turn_off existing_conn.switch)
       (Utils.print_and_ignore "handle new conn with new_prior")
   in
@@ -220,8 +221,9 @@ and add_outgoing t id addr kind =
                 m "%a: Attempting to connect to %a" Fmt.int64 t.node_id pp_addr
                   addr);
             let connect () = Utils.connect_socket addr >>= Lwt.return_ok in
-            Lwt.catch connect Lwt.return_error >>>= fun socket ->
+            U.catch connect Lwt.return_error >>>= fun socket ->
             Lwt_switch.add_hook (Some socket_switch) (fun () ->
+                Log.debug (fun m -> m "Closing outgoing socket");
                 Lwt_unix.close socket);
             let buf = Bytes.create 8 in
             Bytes.set_int64_be buf 0 t.node_id;
@@ -258,20 +260,25 @@ let accept_incomming_loop t addr () =
   let main () =
     let create_sock () =
       Utils.bind_socket addr >>= fun fd ->
-      Lwt_switch.add_hook (Some bound_switch) (fun () -> Lwt_unix.close fd);
+      Lwt_switch.add_hook (Some bound_switch) (fun () -> 
+          Log.debug (fun m -> m "Closing bound switch");
+          Lwt_unix.close fd);
       Lwt_unix.listen fd 128;
       Lwt.return_ok fd
     in
-    Lwt.catch create_sock (fun exn -> Lwt.return_error (`Exn (`Create, exn)))
+    U.catch create_sock (fun exn -> Lwt.return_error (`Exn (`Create, exn)))
     >>>= fun bound_socket ->
     Lwt_switch.add_hook_or_exec (Some t.switch) (fun () ->
         Lwt_switch.turn_off bound_switch)
     >>= fun () ->
     let rec accept_loop () =
-      let accept_switch = Lwt_switch.create () in
-      Lwt.catch
+      let client_switch = Lwt_switch.create () in
+      Log.debug (fun m -> m "Trying to accept new conn");
+      U.catch
         (fun () -> Lwt_unix.accept bound_socket >>= Lwt.return_ok)
-        (fun exn -> Lwt.return_error (`Exn (`Accept, exn)))
+        (fun exn -> 
+           Log.err (fun m -> m "Failed while accepting connection");
+           Lwt.return_error (`Exn (`Accept, exn)))
       >>>= fun (client_sock, _) ->
       let handler () =
         let main =
@@ -282,7 +289,7 @@ let accept_incomming_loop t addr () =
           | Ok id ->
               Log.debug (fun m ->
                   m "%a: Got new conn from %a" Fmt.int64 t.node_id Fmt.int64 id);
-              conn_from_fd ~switch:accept_switch client_sock id `Ephemeral
+              conn_from_fd ~switch:client_switch client_sock id `Ephemeral
               >>= fun descr -> handle_new_conn t descr `Incomming
         in
         main

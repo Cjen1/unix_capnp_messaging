@@ -1,4 +1,5 @@
 open Lwt.Infix
+module U = Utils
 
 let ( >>>= ) = Lwt_result.bind
 
@@ -11,7 +12,7 @@ let compression = `None
 exception Closed
 
 let rec send write buf offset len =
-  Lwt.catch (fun () -> write buf offset len >>= Lwt.return_ok) Lwt.return_error
+  U.catch (fun () -> write buf offset len >>= Lwt.return_ok) Lwt.return_error
   >>= function
   | Ok len' ->
       Log.debug (fun m -> m "Wrote %d to fd" len');
@@ -39,7 +40,7 @@ module Outgoing = struct
     t.latest_xmit >>= function
     | Ok () -> (
         Log.debug (fun m -> m "trying to catch f");
-        Lwt.catch f Lwt.return_error >>= function
+        U.catch f Lwt.return_error >>= function
         | Ok v ->
             t.ongoing <- t.ongoing - 1;
             Lwt.return_ok v
@@ -56,7 +57,7 @@ module Outgoing = struct
         loop (remaining - written) )
       else Lwt.return_ok ()
     in
-    Lwt.catch (fun () -> loop expected_size) Lwt.return_error
+    U.catch (fun () -> loop expected_size) Lwt.return_error
 
   let send t msg =
     if Lwt_switch.is_on t.switch then (
@@ -80,7 +81,7 @@ module Outgoing = struct
         t.ongoing <- t.ongoing + 1;
         p
       in
-      Lwt.catch main Lwt.return_error )
+      U.catch main Lwt.return_error )
     else Lwt.return_error Closed
 
   let create ?switch fd =
@@ -132,7 +133,7 @@ module Incomming = struct
     in
     let recv_buffer = Bytes.create buf_size in
     let rec loop () =
-      Lwt.catch
+      U.catch
         (fun () -> Lwt_unix.read t.fd recv_buffer 0 buf_size >>= Lwt.return_ok)
         Lwt.return_error
       >>= function
@@ -154,7 +155,7 @@ module Incomming = struct
           | Error `EOF ->
               Log.debug (fun m -> m "Connection closed with EOF");
               Lwt_switch.(
-                if is_on t.switch then Lwt_switch.turn_off t.switch
+                if is_on t.switch then turn_off t.switch
                 else Lwt.return_unit) )
     in
     loop ()
