@@ -18,8 +18,8 @@ let addr_of_string s =
   | _ -> Error (`Msg (Fmt.str "Expected address of the form ip:port, not %s" s))
 
 let pp_addr f = function
-  | Unix s -> Fmt.pf f "unix:%s" s
-  | TCP (s, p) -> Fmt.pf f "tcp://%s:%d" s p
+  | Unix s -> Fmt.pf f "%s" s
+  | TCP (s, p) -> Fmt.pf f "%s:%d" s p
 
 module Utils = struct
   let addr_of_host host =
