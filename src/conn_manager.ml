@@ -337,7 +337,7 @@ let create ?(retry_connection_timeout = 10.) ~listen_address ~node_id handler =
 
 let close t =
   Lwt.wakeup (snd t.switch_off_prom_fulfill) ();
-  Lwt_main.yield () >>= fun () -> Lwt_switch.turn_off t.switch
+  Lwt.pause () >>= fun () -> Lwt_switch.turn_off t.switch
 
 let send ?(semantics = `AtMostOnce) t id msg =
   Log.debug (fun m -> m "%a: Sending to %a" Fmt.int64 t.node_id Fmt.int64 id);
@@ -347,7 +347,7 @@ let send ?(semantics = `AtMostOnce) t id msg =
         Log.err (fun m ->
             m "%a: Failed to send message with %a" Fmt.int64 t.node_id Fmt.exn
               exn);
-        Lwt_main.yield ()
+        Lwt.pause ()
   in
   let send () =
     match List.assoc_opt id t.active_conns with

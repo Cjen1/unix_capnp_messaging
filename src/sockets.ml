@@ -150,7 +150,7 @@ module Incomming = struct
           | Ok () -> 
             (
             if Capnp.Codecs.FramedStream.bytes_available t.decoder > 1024 * 1024 then
-              Lwt_main.yield ()
+              Lwt.pause ()
             else Lwt.return_unit) >>= fun () -> (loop [@tailcall]) ()
           | Error `EOF ->
               Log.debug (fun m -> m "Connection closed with EOF");
