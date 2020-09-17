@@ -37,14 +37,17 @@ module Utils = struct
         let socket =
           Unix.(socket PF_UNIX SOCK_STREAM 0) |> Lwt_unix.of_unix_file_descr
         in
-        Lwt_unix.connect socket (Unix.ADDR_UNIX path) >|= fun () -> socket
+        let%lwt () = Lwt_unix.connect socket (Unix.ADDR_UNIX path) in
+        Lwt.return socket
     | TCP (host, port) ->
         Log.info (fun f -> f "Connecting to %s:%d..." host port);
         let socket = Unix.(socket PF_INET SOCK_STREAM 0) in
         Unix.setsockopt socket Unix.SO_KEEPALIVE true;
         let socket = Lwt_unix.of_unix_file_descr socket in
-        Lwt_unix.connect socket (Unix.ADDR_INET (addr_of_host host, port))
-        >|= fun () -> socket
+        let%lwt () =
+          Lwt_unix.connect socket (Unix.ADDR_INET (addr_of_host host, port))
+        in
+        Lwt.return socket
 
   let bind_socket = function
     | Unix path ->
@@ -55,14 +58,17 @@ module Utils = struct
         | exception Unix.Unix_error (Unix.ENOENT, _, _) -> () );
         let socket = Unix.(socket PF_UNIX SOCK_STREAM 0) in
         let socket = socket |> Lwt_unix.of_unix_file_descr in
-        Lwt_unix.bind socket (Unix.ADDR_UNIX path) >|= fun () -> socket
+        let%lwt () = Lwt_unix.bind socket (Unix.ADDR_UNIX path) in
+        Lwt.return socket
     | TCP (host, port) ->
         Log.info (fun f -> f "Binding to %s:%d..." host port);
         let socket = Unix.(socket PF_INET SOCK_STREAM 0) in
         Unix.setsockopt socket Unix.SO_REUSEADDR true;
         let socket = Lwt_unix.of_unix_file_descr socket in
-        Lwt_unix.bind socket (Unix.ADDR_INET (addr_of_host host, port))
-        >|= fun () -> socket
+        let%lwt () =
+          Lwt_unix.bind socket (Unix.ADDR_INET (addr_of_host host, port))
+        in
+        Lwt.return socket
 
   let print_and_ignore src exn =
     Log.err (fun m -> m "Caught %a in %s" Fmt.exn exn src);
@@ -87,8 +93,11 @@ type recv_handler =
   Capnp.MessageSig.ro Capnp.BytesMessage.Message.t ->
   (unit, exn) Lwt_result.t
 
+and recv_handler_wrapper =
+  t -> node_id -> Capnp.MessageSig.ro Capnp.BytesMessage.Message.t -> unit
+
 and t = {
-  handler : recv_handler;
+  handler : recv_handler_wrapper;
   mutable active_conns : (node_id * conn_descr) list;
   mutable persist_ids : (node_id * address) list;
   switch : Lwt_switch.t;
@@ -97,14 +106,12 @@ and t = {
   node_id : node_id;
 }
 
-exception EOF
+exception Closed = Sockets.Closed
 
 let rec read_exactly fd buf offset len () =
-  U.catch
-    (fun () -> Lwt_unix.read fd buf offset len)
-    (fun exn -> Lwt.fail exn)
-  >>= function
-  | 0 -> Lwt.fail EOF
+  let%lwt read = Lwt_unix.read fd buf offset len in
+  match read with
+  | 0 -> Lwt.fail Closed
   | read when read = len -> Lwt.return_ok ()
   | read -> (read_exactly [@tailcall]) fd buf (offset + read) (len - offset) ()
 
@@ -114,27 +121,19 @@ let get_id_from_sock sock =
   Bytes.get_int64_be buf 0 |> Lwt.return_ok
 
 let recv_handler_wrapper t conn_descr () =
-  let rec loop () =
-    Sockets.Incomming.recv conn_descr.in_socket >>= function
-    | Ok msg ->
-        let p =
-          U.catch
-            (fun () -> t.handler t conn_descr.node_id msg)
-            Lwt.return_error
-          >|= function
-          | Ok () -> ()
-          | Error exn ->
-              Log.err (fun m -> m "Handler failed with %a" Fmt.exn exn)
-        in
-        Lwt.async (fun () -> p);
-        loop ()
-    | Error Sockets.Closed ->
+  let error_handler = function
+    | Sockets.Closed ->
         Log.debug (fun m -> m "%a: Socket closed" Fmt.int64 t.node_id);
         Lwt.return_unit
-    | Error exn ->
+    | exn ->
         Log.err (fun m -> m "Recv loop exited with exn: %a" Fmt.exn exn);
         Lwt.return_unit
   in
+  let rec catch_wrapper () =
+    let%lwt msg = Sockets.Incomming.recv conn_descr.in_socket in
+    t.handler t conn_descr.node_id msg;
+    loop ()
+  and loop () = Lwt.catch catch_wrapper error_handler in
   loop ()
 
 let conn_from_fd ?switch ?incomming ?outgoing fd id kind =
@@ -149,14 +148,15 @@ let conn_from_fd ?switch ?incomming ?outgoing fd id kind =
     | Some v -> Lwt.return v
     | None -> Sockets.Outgoing.create ~switch fd
   in
-  Lwt.both ip op >|= fun (in_socket, out_socket) ->
-  { node_id = id; in_socket; out_socket; switch; kind }
+  let%lwt in_socket, out_socket = Lwt.both ip op in
+  Lwt.return { node_id = id; in_socket; out_socket; switch; kind }
 
 (* Adds connection to active conns *)
 let rec add_conn t (conn_descr : conn_descr) =
-  Lwt_switch.add_hook_or_exec (Some t.switch) (fun () ->
-      Lwt_switch.turn_off conn_descr.switch)
-  >>= fun () ->
+  let%lwt () =
+    Lwt_switch.add_hook_or_exec (Some t.switch) (fun () ->
+        Lwt_switch.turn_off conn_descr.switch)
+  in
   t.active_conns <- (conn_descr.node_id, conn_descr) :: t.active_conns;
   Log.debug (fun m ->
       m "%a: Added %a to active connections" Fmt.int64 t.node_id Fmt.int64
@@ -193,10 +193,9 @@ and handle_new_conn t (new_conn : conn_descr) direction =
         m "Preexisting conn from %a and they initiate, => kill old" Fmt.int64
           other_id);
     t.active_conns <- List.remove_assoc other_id t.active_conns;
-    add_conn t new_conn >>= fun () ->
-    U.catch
-      (fun () -> Lwt_switch.turn_off existing_conn.switch)
-      (Utils.print_and_ignore "handle new conn with new_prior")
+    let%lwt () = add_conn t new_conn in
+    Sockets.turn_off_switch existing_conn.switch;
+    Lwt.return_unit
   in
   match (List.assoc_opt other_id t.active_conns, direction) with
   | Some _, `Incomming when t.node_id > other_id -> old_prior ()
@@ -227,18 +226,17 @@ and add_outgoing t id addr kind =
                 Lwt_unix.close socket);
             let buf = Bytes.create 8 in
             Bytes.set_int64_be buf 0 t.node_id;
-            let buf = Lwt_bytes.of_bytes buf in
-            Sockets.send (Lwt_bytes.write socket) buf 0 8 >>>= fun () ->
-            conn_from_fd socket ~switch:socket_switch id kind >>= fun descr ->
+            let%lwt () = Sockets.write_all socket buf 0 8 in
+            let%lwt descr = conn_from_fd socket ~switch:socket_switch id kind in
             handle_new_conn t descr `Outgoing >>= Lwt.return_ok
           in
-          setup_socket >>= function
+          match%lwt setup_socket with
           | Ok () -> Lwt.return_ok ()
           | Error exn ->
-              Lwt_switch.turn_off socket_switch >>= fun () ->
+              Sockets.turn_off_switch socket_switch;
               Lwt.return_error exn )
     in
-    main >>= function
+    match%lwt main with
     | _ when not (Lwt_switch.is_on t.switch) ->
         Log.debug (fun m ->
             m "%a: Retry loop stopped because manager is closed" Fmt.int64
@@ -249,7 +247,7 @@ and add_outgoing t id addr kind =
         Log.err (fun m -> m "Failed while connecting: %a" Fmt.exn exn);
         match kind with
         | `Persistant _ ->
-            Lwt_unix.sleep t.retry_connection_timeout >>= fun () ->
+            let%lwt () = Lwt_unix.sleep t.retry_connection_timeout in
             retry_loop ()
         | `Ephemeral -> Lwt.return_unit )
   in
@@ -259,8 +257,8 @@ let accept_incomming_loop t addr () =
   let bound_switch = Lwt_switch.create () in
   let main () =
     let create_sock () =
-      Utils.bind_socket addr >>= fun fd ->
-      Lwt_switch.add_hook (Some bound_switch) (fun () -> 
+      let%lwt fd = Utils.bind_socket addr in
+      Lwt_switch.add_hook (Some bound_switch) (fun () ->
           Log.debug (fun m -> m "Closing bound switch");
           Lwt_unix.close fd);
       Lwt_unix.listen fd 128;
@@ -268,29 +266,32 @@ let accept_incomming_loop t addr () =
     in
     U.catch create_sock (fun exn -> Lwt.return_error (`Exn (`Create, exn)))
     >>>= fun bound_socket ->
-    Lwt_switch.add_hook_or_exec (Some t.switch) (fun () ->
-        Lwt_switch.turn_off bound_switch)
-    >>= fun () ->
+    let%lwt () =
+      Lwt_switch.add_hook_or_exec (Some t.switch) (fun () ->
+          Lwt_switch.turn_off bound_switch)
+    in
     let rec accept_loop () =
       let client_switch = Lwt_switch.create () in
       Log.debug (fun m -> m "Trying to accept new conn");
       U.catch
         (fun () -> Lwt_unix.accept bound_socket >>= Lwt.return_ok)
-        (fun exn -> 
-           Log.err (fun m -> m "Failed while accepting connection");
-           Lwt.return_error (`Exn (`Accept, exn)))
+        (fun exn ->
+          Log.err (fun m -> m "Failed while accepting connection");
+          Lwt.return_error (`Exn (`Accept, exn)))
       >>>= fun (client_sock, _) ->
       let handler () =
         let main =
-          get_id_from_sock client_sock >>= function
+          match%lwt get_id_from_sock client_sock with
           | Error exn ->
               Log.err (fun m -> m "Couldn't get id from sock %a" Fmt.exn exn);
               Lwt.return_unit
           | Ok id ->
               Log.debug (fun m ->
                   m "%a: Got new conn from %a" Fmt.int64 t.node_id Fmt.int64 id);
-              conn_from_fd ~switch:client_switch client_sock id `Ephemeral
-              >>= fun descr -> handle_new_conn t descr `Incomming
+              let%lwt descr =
+                conn_from_fd ~switch:client_switch client_sock id `Ephemeral
+              in
+              handle_new_conn t descr `Incomming
         in
         main
       in
@@ -299,8 +300,8 @@ let accept_incomming_loop t addr () =
     in
     accept_loop ()
   in
-  main () >>= fun v ->
-  Lwt_switch.turn_off bound_switch >>= fun () ->
+  let%lwt v = main () in
+  let%lwt () = Lwt_switch.turn_off bound_switch in
   match v with
   | _ when not @@ Lwt_switch.is_on t.switch -> Lwt.return_unit
   | Ok () -> Fmt.failwith "accept loop ended unexpectedly"
@@ -318,9 +319,32 @@ let accept_incomming_loop t addr () =
       Lwt.return_unit
   | Error _ -> Fmt.failwith "Unknown tag encountered in accept loop"
 
-let create ?(retry_connection_timeout = 10.) ~listen_address ~node_id handler =
+let create ?(retry_connection_timeout = 10.) ~listen_address ~node_id
+    (src_handler : recv_handler) =
   let switch = Lwt_switch.create () in
   let switch_off_prom_fulfill = Lwt.task () in
+  (*
+            U.catch
+            (fun () -> t.handler t conn_descr.node_id msg)
+            Lwt.return_error
+          >|= function
+          | Ok () -> ()
+          | Error exn ->
+              Log.err (fun m -> m "Handler failed with %a" Fmt.exn exn)
+        in
+        Lwt.async (fun () -> p);
+        loop ()
+     *)
+  let handler t id msg =
+    ignore @@ match%lwt src_handler t id msg with
+    | Ok () -> Lwt.return_unit
+    | Error exn ->
+      Log.err (fun m -> m "Handler failed %a" Fmt.exn exn);
+      Lwt.return_unit
+    | exception exn ->
+      Log.err (fun m -> m "Handler failed %a" Fmt.exn exn);
+      Lwt.return_unit
+  in
   let t =
     {
       active_conns = [];
@@ -337,7 +361,8 @@ let create ?(retry_connection_timeout = 10.) ~listen_address ~node_id handler =
 
 let close t =
   Lwt.wakeup (snd t.switch_off_prom_fulfill) ();
-  Lwt.pause () >>= fun () -> Lwt_switch.turn_off t.switch
+  let%lwt () = Lwt.pause () in
+  Lwt_switch.turn_off t.switch
 
 let send ?(semantics = `AtMostOnce) t id msg =
   Log.debug (fun m -> m "%a: Sending to %a" Fmt.int64 t.node_id Fmt.int64 id);
@@ -352,24 +377,25 @@ let send ?(semantics = `AtMostOnce) t id msg =
   let send () =
     match List.assoc_opt id t.active_conns with
     | None ->
-        Lwt.return_error
+        Lwt.fail
           (Invalid_argument
              (Fmt.str "Not found %a in active_conns" Fmt.int64 id))
     | Some conn_descr -> Sockets.Outgoing.send conn_descr.out_socket msg
   in
   match semantics with
-  | `AtMostOnce -> send () >>= err_handler >>= Lwt.return_ok
+  | `AtMostOnce -> send () >>= Lwt.return_ok
   | `AtLeastOnce ->
       let rec loop () =
-        send () >>= function
-        | Ok v -> Lwt.return v
-        | Error Sockets.Closed ->
+        match%lwt send () with
+        |  v -> Lwt.return v
+        | exception Sockets.Closed ->
             Log.debug (fun m ->
                 m "%a: Failed to send on closed socket" Fmt.int64 t.node_id);
             Lwt.return ()
-        | Error exn ->
-            err_handler (Error exn) >>= fun () ->
+        | exception exn ->
+            let%lwt () = err_handler (Error exn) in
             Log.debug (fun m -> m "%a: Looping to retry" Fmt.int64 t.node_id);
             (loop [@tailcall]) ()
       in
-      loop () >>= fun res -> Lwt.return_ok res
+      let%lwt res = loop () in
+      Lwt.return_ok res

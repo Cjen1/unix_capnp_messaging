@@ -1,5 +1,6 @@
 open Lwt.Infix
 module U = Utils
+module FS = Capnp.Codecs.FramedStream
 
 let ( >>>= ) = Lwt_result.bind
 
@@ -11,94 +12,66 @@ let compression = `None
 
 exception Closed
 
-let rec send write buf offset len =
-  U.catch (fun () -> write buf offset len >>= Lwt.return_ok) Lwt.return_error
-  >>= function
-  | Ok len' ->
-      Log.debug (fun m -> m "Wrote %d to fd" len');
-      if len' < len then
-        (send [@tailcall]) write buf (offset + len') (len - len')
-      else Lwt.return_ok ()
-  | Error e ->
-      Log.err (fun m -> m "Failed to send %a" Fmt.exn e);
-      Lwt.return_error e
+let turn_off_switch switch =
+  if Lwt_switch.is_on switch then
+    let p = Lwt_switch.turn_off switch in
+    Lwt.on_failure p !Lwt.async_exception_hook
+
+type 'a msg = 'a Capnp.BytesMessage.Message.t
+
+let rec write_all fd buf offset len =
+  let%lwt written = Lwt_unix.write fd buf offset len in
+  if written < len then
+    (write_all [@tailcall]) fd buf (offset + written) (len - written)
+  else Lwt.return_unit
 
 module Outgoing = struct
   type t = {
     fd : Lwt_unix.file_descr;
-    mutable ongoing : int;
-    mutable latest_xmit : (unit, exn) Lwt_result.t;
-    switch_off_promise : (unit, exn) Lwt_result.t;
+    queue_reader : (Capnp.MessageSig.ro msg * unit Lwt.u) Lwt_stream.t;
+    queue_push : Capnp.MessageSig.ro msg * unit Lwt.u -> unit;
     switch : Lwt_switch.t;
   }
 
-  let prev_send_wrapper t f =
-    let failure e =
-      Log.err (fun m -> m "Failed to send with %a" Fmt.exn e);
-      Lwt_switch.turn_off t.switch >>= fun () -> Lwt.return_error Closed
+  let write_thread t =
+    let iter (msg, fulfiller) =
+      let buf =
+        Capnp.Codecs.serialize ~compression:`None msg |> Bytes.unsafe_of_string
+      in
+      let%lwt () = write_all t.fd buf 0 (Bytes.length buf) in
+      Lwt.wakeup_later fulfiller ();
+      Lwt.return_unit
     in
-    t.latest_xmit >>= function
-    | Ok () -> (
-        Log.debug (fun m -> m "trying to catch f");
-        U.catch f Lwt.return_error >>= function
-        | Ok v ->
-            t.ongoing <- t.ongoing - 1;
-            Lwt.return_ok v
-        | Error e -> failure e )
-    | Error e ->
-        Log.debug (fun m -> m "Prev failed");
-        failure e
-
-  let write_vec fd v expected_size =
-    let rec loop remaining =
-      Lwt_unix.writev fd v >>= fun written ->
-      if written <> remaining then (
-        Lwt_unix.IO_vectors.drop v written;
-        loop (remaining - written) )
-      else Lwt.return_ok ()
-    in
-    U.catch (fun () -> loop expected_size) Lwt.return_error
+    let p = Lwt_stream.iter_s iter t.queue_reader in
+    Lwt.on_failure p (fun exn ->
+        Log.err (fun m -> m "Write thread failed with %a" Fmt.exn exn);
+        if Lwt_switch.is_on t.switch then turn_off_switch t.switch)
 
   let send t msg =
-    if Lwt_switch.is_on t.switch then (
-      Log.debug (fun m -> m "Trying to send");
-      let main () =
-        let append_to_vec buf (io, written) str len =
-          Lwt_unix.IO_vectors.append_bytes io (Bytes.unsafe_of_string str) 0 len;
-          Buffer.add_bytes buf (Bytes.unsafe_of_string str |> BytesLabels.sub ~pos:0 ~len);
-          (io, len + written)
-        in
-        let write_p () =
-          let buf = Buffer.create 150 in
-          let vec, expected_size =
-            Capnp.Codecs.serialize_fold_copyless msg ~compression:`None
-              ~init:(Lwt_unix.IO_vectors.create (), 0)
-              ~f:(append_to_vec buf)
-          in
-          write_vec t.fd vec expected_size
-        in
-        let msg_p = prev_send_wrapper t write_p in
-        let p = Lwt.choose [ msg_p; t.switch_off_promise ] in
-        t.latest_xmit <- p;
-        t.ongoing <- t.ongoing + 1;
-        p
-      in
-      U.catch main Lwt.return_error )
-    else Lwt.return_error Closed
+    let msg = Capnp.BytesMessage.Message.readonly msg in
+    let task, u = Lwt.task () in
+    t.queue_push (msg, u);
+    task
 
   let create ?switch fd =
     let switch =
       match switch with Some switch -> switch | None -> Lwt_switch.create ()
     in
-    let off_p, off_f = Lwt.task () in
-    Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
-        Lwt.wakeup off_f (Error Closed);
-        Lwt.return_unit)
-    >>= fun () ->
-    let latest_xmit = Lwt.return_ok () in
-    let t =
-      { fd; latest_xmit; ongoing = 0; switch_off_promise = off_p; switch }
+    let stream, queue_push = Lwt_stream.create () in
+    let%lwt () =
+      Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
+          queue_push None;
+          Lwt.return_unit)
     in
+    let t =
+      {
+        fd;
+        queue_reader = stream;
+        queue_push = (fun v -> queue_push (Some v));
+        switch;
+      }
+    in
+    write_thread t;
     Lwt.return t
 end
 
@@ -112,8 +85,8 @@ module Incomming = struct
 
   let rec recv t =
     match Capnp.Codecs.FramedStream.get_next_frame t.decoder with
-    | _ when not (Lwt_switch.is_on t.switch) -> Lwt.return_error Closed
-    | Ok msg -> Lwt.return (Ok (Capnp.BytesMessage.Message.readonly msg))
+    | _ when not (Lwt_switch.is_on t.switch) -> Lwt.fail Closed
+    | Ok msg -> Lwt.return (Capnp.BytesMessage.Message.readonly msg)
     | Error Capnp.Codecs.FramingError.Unsupported ->
         failwith "Unsupported Cap'n'Proto frame received"
     | Error Capnp.Codecs.FramingError.Incomplete ->
@@ -126,41 +99,39 @@ module Incomming = struct
         let buf = Bytes.sub recv_buffer 0 len in
         Capnp.Codecs.FramedStream.add_fragment t.decoder
           (Bytes.unsafe_to_string buf);
-        Lwt_condition.broadcast t.recv_cond ();
-        if Capnp.Codecs.FramedStream.bytes_available t.decoder > 2*1024*1024 then
-          Log.err (fun m -> m "Queuing in the recv socket of %d" (Capnp.Codecs.FramedStream.bytes_available t.decoder));
+        Lwt_condition.signal t.recv_cond ();
+        if Capnp.Codecs.FramedStream.bytes_available t.decoder > 2 * 1024 * 1024
+        then
+          Log.err (fun m ->
+              m "Queuing in the recv socket of %d"
+                (Capnp.Codecs.FramedStream.bytes_available t.decoder));
         (* don't need to wipe buffer since will be wiped by Bytes.sub *)
         Ok () )
       else Error `EOF
     in
     let recv_buffer = Bytes.create buf_size in
     let rec loop () =
-      U.catch
-        (fun () -> Lwt_unix.read t.fd recv_buffer 0 buf_size >>= Lwt.return_ok)
-        Lwt.return_error
-      >>= function
-      | _ when not (Lwt_switch.is_on t.switch) ->
+      let%lwt read = Lwt_unix.read t.fd recv_buffer 0 buf_size in
+      match Lwt_switch.is_on t.switch with
+      | false ->
           Log.debug (fun m -> m "Connection closed");
-          Lwt.return_unit
-      | Error e ->
-          Log.err (fun m ->
-              m "Failed to receive with %a, closing conn" Fmt.exn e);
-          Lwt_switch.turn_off t.switch
-      | Ok len -> (
-          Log.debug (fun m -> m "Recieved data from socket");
-          match handler recv_buffer len with
-          | Ok () -> 
-            (
-            if Capnp.Codecs.FramedStream.bytes_available t.decoder > 1024 * 1024 then
-              Lwt.pause ()
-            else Lwt.return_unit) >>= fun () -> (loop [@tailcall]) ()
+          Lwt.fail Closed
+      | true -> (
+          match handler recv_buffer read with
+          | Ok () ->
+              let%lwt () =
+                if FS.bytes_available t.decoder > 1024 * 1024 then Lwt.pause ()
+                else Lwt.return_unit
+              in
+              (loop [@tailcall]) ()
           | Error `EOF ->
               Log.debug (fun m -> m "Connection closed with EOF");
-              Lwt_switch.(
-                if is_on t.switch then turn_off t.switch
-                else Lwt.return_unit) )
+              turn_off_switch t.switch;
+              Lwt.return_unit )
     in
-    loop ()
+    Lwt.on_failure (loop ()) (function
+      | _ when Lwt_switch.is_on t.switch -> turn_off_switch t.switch
+      | _ -> ())
 
   let create ?switch fd =
     let decoder = Capnp.Codecs.FramedStream.empty compression in
@@ -169,7 +140,7 @@ module Incomming = struct
     in
     let recv_cond = Lwt_condition.create () in
     let t = { fd; decoder; switch; recv_cond } in
-    Lwt.async (fun () -> recv_thread t);
+    recv_thread t;
     Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
         Lwt_condition.broadcast recv_cond ();
         Lwt.return_unit)

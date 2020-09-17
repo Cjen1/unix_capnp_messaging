@@ -1,5 +1,5 @@
 (tests
- (names sockets conn_manager go_interact)
+ (names sockets conn_manager )
  (libraries core unix_capnp_messaging alcotest alcotest-lwt protocol_api))
 
 (env

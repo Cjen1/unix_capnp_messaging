@@ -37,8 +37,8 @@ let test_loop _ () =
   let switch = Lwt_switch.create () in
   Lwt.both (Incomming.create ~switch fd1) (Outgoing.create ~switch fd2)
   >>= fun (ins, out) ->
-  test_message |> of_store |> Outgoing.send out |> exn_handler >>= fun () ->
-  Lwt.choose [ timeout 1.; Incomming.recv ins ] >>= fun msg ->
+  test_message |> of_store |> Outgoing.send out >>= fun () ->
+  Lwt.choose [ timeout 1.; Incomming.recv ins >>= Lwt.return_ok ] >>= fun msg ->
   let ( >>>= ) = Result.bind in
   Alcotest.(check (result string exn))
     "Send and receive"
@@ -63,7 +63,7 @@ let test_stress size _ () =
   let max_concurrency = 1 in
   let stream = List.init size test_message |> Lwt_stream.of_list in
   let send_i msg =
-    Outgoing.send out msg >>= fun res -> Result.get_ok res |> Lwt.return
+    Outgoing.send out msg
   in
   let send_p = Lwt_stream.iter_n ~max_concurrency send_i stream in
   let generator () =
@@ -74,7 +74,7 @@ let test_stress size _ () =
       ]
   in
   let recv_stream =
-    Lwt_stream.from generator |> Lwt_stream.map (fun v -> Result.get_ok v)
+    Lwt_stream.from generator
   in
   let fold v expected =
     let buf = to_store v in
@@ -94,15 +94,18 @@ let test_lwt_result str test_exn res =
   | Ok _v -> Alcotest.fail (Fmt.str "No exception raised for %s" str)
   | Error exn -> Alcotest.check_raises str test_exn (fun () -> raise exn)
 
+let catch f =
+  Lwt.catch (fun () -> f () >>= Lwt.return_ok) (Lwt.return_error)
+
 let test_closed_switch _ () =
   let fd1, fd2 = Lwt_unix.pipe () in
   let switch = Lwt_switch.create () in
   Lwt.both (Incomming.create ~switch fd1) (Outgoing.create ~switch fd2)
   >>= fun (ins, out) ->
   Lwt_switch.turn_off switch >>= fun () ->
-  test_message |> of_store |> Outgoing.send out >>= fun tmp ->
+  catch (fun () -> test_message |> of_store |> Outgoing.send out) >>= fun tmp ->
   test_lwt_result "Send on closed outgoing" Sockets.Closed tmp;
-  Incomming.recv ins
+  catch (fun () -> Incomming.recv ins)
   >|= test_lwt_result "Recv on closed incommming" Sockets.Closed
 
 let test_closed_fd _ () =
@@ -110,9 +113,9 @@ let test_closed_fd _ () =
   let switch = Lwt_switch.create () in
   Lwt.both (Incomming.create fd1) (Outgoing.create fd2) >>= fun (ins, out) ->
   Lwt_unix.close fd1 >>= fun () ->
-  test_message |> of_store |> Outgoing.send out >>= fun tmp ->
+  catch (fun () -> test_message |> of_store |> Outgoing.send out) >>= fun tmp ->
   test_lwt_result "Send on closed outgoing" Sockets.Closed tmp;
-  Incomming.recv ins
+  catch(fun () -> Incomming.recv ins)
   >|= test_lwt_result "Recv on closed incommming" Sockets.Closed
   >>= fun () -> Lwt_switch.turn_off switch
 
