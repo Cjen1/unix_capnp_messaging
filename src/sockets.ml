@@ -63,15 +63,17 @@ module Outgoing = struct
     if Lwt_switch.is_on t.switch then (
       Log.debug (fun m -> m "Trying to send");
       let main () =
-        let append_to_vec (io, written) str len =
+        let append_to_vec buf (io, written) str len =
           Lwt_unix.IO_vectors.append_bytes io (Bytes.unsafe_of_string str) 0 len;
+          Buffer.add_bytes buf (Bytes.unsafe_of_string str |> BytesLabels.sub ~pos:0 ~len);
           (io, len + written)
         in
         let write_p () =
+          let buf = Buffer.create 150 in
           let vec, expected_size =
             Capnp.Codecs.serialize_fold_copyless msg ~compression:`None
               ~init:(Lwt_unix.IO_vectors.create (), 0)
-              ~f:append_to_vec
+              ~f:(append_to_vec buf)
           in
           write_vec t.fd vec expected_size
         in
