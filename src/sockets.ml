@@ -28,50 +28,36 @@ let rec write_all fd buf offset len =
 module Outgoing = struct
   type t = {
     fd : Lwt_unix.file_descr;
-    queue_reader : (Capnp.MessageSig.ro msg * unit Lwt.u) Lwt_stream.t;
-    queue_push : Capnp.MessageSig.ro msg * unit Lwt.u -> unit;
+    mutex : Lwt_mutex.t;
     switch : Lwt_switch.t;
   }
 
-  let write_thread t =
-    let iter (msg, fulfiller) =
-      let buf =
-        Capnp.Codecs.serialize ~compression:`None msg |> Bytes.unsafe_of_string
-      in
-      let%lwt () = write_all t.fd buf 0 (Bytes.length buf) in
-      Lwt.wakeup_later fulfiller ();
-      Lwt.return_unit
-    in
-    let p = Lwt_stream.iter_s iter t.queue_reader in
-    Lwt.on_failure p (fun exn ->
-        Log.err (fun m -> m "Write thread failed with %a" Fmt.exn exn);
-        if Lwt_switch.is_on t.switch then turn_off_switch t.switch)
-
   let send t msg =
-    let msg = Capnp.BytesMessage.Message.readonly msg in
-    let task, u = Lwt.task () in
-    t.queue_push (msg, u);
-    task
+    let buf =
+      Capnp.Codecs.serialize ~compression:`None msg |> Bytes.unsafe_of_string
+    in
+    Lwt_mutex.with_lock t.mutex (fun () ->
+        match Lwt_switch.is_on t.switch with
+        | false -> Lwt.fail Closed
+        | true ->
+        try%lwt write_all t.fd buf 0 (Bytes.length buf)
+        with exn ->
+          Log.err (fun m -> m "Write thread failed with %a" Fmt.exn exn);
+          turn_off_switch t.switch;
+          Lwt.return_unit
+      )
 
   let create ?switch fd =
     let switch =
       match switch with Some switch -> switch | None -> Lwt_switch.create ()
     in
-    let stream, queue_push = Lwt_stream.create () in
-    let%lwt () =
-      Lwt_switch.add_hook_or_exec (Some switch) (fun () ->
-          queue_push None;
-          Lwt.return_unit)
-    in
     let t =
       {
         fd;
-        queue_reader = stream;
-        queue_push = (fun v -> queue_push (Some v));
+        mutex = Lwt_mutex.create ();
         switch;
       }
     in
-    write_thread t;
     Lwt.return t
 end
 
