@@ -44,7 +44,7 @@ module Outgoing = struct
         with exn ->
           Log.err (fun m -> m "Write thread failed with %a" Fmt.exn exn);
           turn_off_switch t.switch;
-          Lwt.return_unit
+          Lwt.fail Closed
       )
 
   let create ?switch fd =
